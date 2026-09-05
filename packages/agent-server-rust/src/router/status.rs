@@ -9,7 +9,6 @@ use axum::{
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use base64::Engine;
 use crate::context::create_context;
 use crate::db::get_db;
 use crate::execution::run_execution_loop;
@@ -22,6 +21,7 @@ use crate::tools::a11y::get_a11y_desktop;
 use crate::tools::exec::ExecOptions;
 use crate::tools::qr::{decode_qr_from_base64, to_data_url};
 use crate::tools::screenshot::capture_screenshot;
+use base64::Engine;
 
 pub async fn get_status() -> Json<serde_json::Value> {
     Json(serde_json::json!({
@@ -73,6 +73,15 @@ pub fn determine_auth_status(
 ///
 /// Gets the a11y tree, identifies the current state, and runs
 /// the reducer. Chat states set `is_logged_in = true`.
+/// Pure decision function: only persist state if the current observation yielded
+/// a recognized main window state that was successfully reduced.
+pub fn should_persist_observed_state(
+    current_identified_main_window: Option<&crate::ia::types::IdentifiedState>,
+    reduce_succeeded: bool,
+) -> bool {
+    current_identified_main_window.is_some() && reduce_succeeded
+}
+
 pub async fn auth_status() -> Json<serde_json::Value> {
     let session = match get_session("default") {
         Some(s) => s,
@@ -108,9 +117,7 @@ pub async fn auth_status() -> Json<serde_json::Value> {
         }
     };
 
-    let screenshot = capture_screenshot(&exec_options)
-        .await
-        .unwrap_or_default();
+    let screenshot = capture_screenshot(&exec_options).await.unwrap_or_default();
     let identified = identify_states(&a11y, &screenshot);
 
     // Load persisted state and apply reduce
@@ -118,6 +125,8 @@ pub async fn auth_status() -> Json<serde_json::Value> {
         let db = get_db();
         create_context(session.clone(), &db)
     };
+
+    let mut reduced_fresh_state = false;
 
     if let Some(ref mw) = identified.main_window {
         if let Some(state_impl) = find_state_by_id(&mw.state_id) {
@@ -129,11 +138,13 @@ pub async fn auth_status() -> Json<serde_json::Value> {
                 a11y: &a11y,
                 screenshot: &screenshot_bytes,
             });
+            reduced_fresh_state = true;
         }
     }
 
-    // Save updated state
-    {
+    // Only persist when current observation has an identified main window and successfully reduced.
+    // Stale or unidentified states must NEVER be saved back into DB as if fresh.
+    if should_persist_observed_state(identified.main_window.as_ref(), reduced_fresh_state) {
         let db = get_db();
         context.save(&db);
     }
@@ -141,7 +152,7 @@ pub async fn auth_status() -> Json<serde_json::Value> {
     let status = determine_auth_status(
         wechat_running,
         identified.main_window.as_ref(),
-        if identified.main_window.is_some() {
+        if reduced_fresh_state {
             Some(&context.state.main_window)
         } else {
             None
@@ -321,7 +332,9 @@ async fn handle_login_ws(mut socket: WebSocket, params: LoginWsParams) {
         let emit = move |event: SubscriptionEvent| {
             let _ = tx.send(event);
         };
-        run_execution_loop(&plan, &login_params, &mut context, &emit, cancel_for_exec).await.0
+        run_execution_loop(&plan, &login_params, &mut context, &emit, cancel_for_exec)
+            .await
+            .0
     });
 
     // Main loop: bridge events to WebSocket, handle timeout + disconnect
@@ -377,7 +390,9 @@ async fn handle_login_ws(mut socket: WebSocket, params: LoginWsParams) {
     let exec_result = exec_handle.await.ok();
     if !client_disconnected && !sent_terminal {
         let fallback = match exec_result {
-            Some(result) if result.success => LoginSubscriptionEvent::LoginSuccess { user_id: None },
+            Some(result) if result.success => {
+                LoginSubscriptionEvent::LoginSuccess { user_id: None }
+            }
             Some(result) => {
                 let message = result.error.unwrap_or_else(|| "Login failed".to_string());
                 if message.starts_with("Unknown state for")
@@ -461,11 +476,30 @@ fn subscription_event_to_login_event(event: SubscriptionEvent) -> LoginSubscript
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ia::types::{AppState, IdentifiedState, MainWindowView};
+    use crate::context::Context;
+    use crate::ia::types::{AppState, IdentifiedState, MainWindowView, Session};
+    use rusqlite::Connection;
+
+    fn setup_test_db() -> Connection {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                status TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS context (
+                session_id TEXT PRIMARY KEY,
+                app_state TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );",
+        )
+        .expect("create tables");
+        conn
+    }
 
     #[test]
     fn test_a_persisted_chat_current_unidentified_returns_unknown() {
@@ -475,7 +509,10 @@ mod tests {
         let current_reduced = None;
 
         let status = determine_auth_status(has_process, current_identified, current_reduced);
-        assert_ne!(status, "logged_in", "Unidentified observation must not return logged_in");
+        assert_ne!(
+            status, "logged_in",
+            "Unidentified observation must not return logged_in"
+        );
         assert_eq!(status, "unknown");
     }
 
@@ -492,8 +529,15 @@ mod tests {
         current_reduced.view = MainWindowView::LoginAccount;
         current_reduced.is_logged_in = false;
 
-        let status = determine_auth_status(has_process, current_identified.as_ref(), Some(&current_reduced));
-        assert_ne!(status, "logged_in", "LoginAccount observation must not return logged_in");
+        let status = determine_auth_status(
+            has_process,
+            current_identified.as_ref(),
+            Some(&current_reduced),
+        );
+        assert_ne!(
+            status, "logged_in",
+            "LoginAccount observation must not return logged_in"
+        );
         assert_eq!(status, "logged_out");
     }
 
@@ -510,7 +554,11 @@ mod tests {
         current_reduced.view = MainWindowView::Chat;
         current_reduced.is_logged_in = true;
 
-        let status = determine_auth_status(has_process, current_identified.as_ref(), Some(&current_reduced));
+        let status = determine_auth_status(
+            has_process,
+            current_identified.as_ref(),
+            Some(&current_reduced),
+        );
         assert_eq!(status, "logged_in");
     }
 
@@ -518,5 +566,169 @@ mod tests {
     fn test_process_not_running_returns_app_not_running() {
         let status = determine_auth_status(false, None, None);
         assert_eq!(status, "app_not_running");
+    }
+
+    #[test]
+    fn test_should_persist_observed_state_logic() {
+        let identified = IdentifiedState {
+            state_id: "chat".to_string(),
+            fsm: "mainWindow".to_string(),
+            frame: None,
+        };
+
+        // Identified and reduce succeeded -> persist
+        assert!(should_persist_observed_state(Some(&identified), true));
+
+        // Identified but reduce failed -> do not persist
+        assert!(!should_persist_observed_state(Some(&identified), false));
+
+        // Unidentified -> do not persist regardless of reduce flag
+        assert!(!should_persist_observed_state(None, true));
+        assert!(!should_persist_observed_state(None, false));
+    }
+
+    fn create_test_session(id: &str) -> Session {
+        Session {
+            id: id.to_string(),
+            name: "test".to_string(),
+            linux_user: "wechat".to_string(),
+            display: ":99".to_string(),
+            dbus_address: None,
+            vnc_port: 5900,
+            status: "running".to_string(),
+            login_state: "logged_out".to_string(),
+            logged_in_user: None,
+            wechat_pid: Some(1234),
+            xvfb_pid: None,
+            dbus_pid: None,
+            error_message: None,
+            created_at: "2026-09-05T00:00:00Z".to_string(),
+            updated_at: "2026-09-05T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_unidentified_current_ui_does_not_resave_stale_chat_state() {
+        let conn = setup_test_db();
+        let session = create_test_session("test-sess-1");
+
+        // Seed DB with previously saved Chat state
+        let mut initial_ctx = Context::new(session.clone());
+        initial_ctx.state.main_window.view = MainWindowView::Chat;
+        initial_ctx.state.main_window.is_logged_in = true;
+        initial_ctx.save(&conn);
+
+        // Manually set a known timestamp for updated_at
+        conn.execute(
+            "UPDATE context SET updated_at = '2026-09-05 00:00:00' WHERE session_id = ?1",
+            rusqlite::params![session.id],
+        )
+        .expect("update timestamp");
+
+        // Simulate unidentified observation cycle:
+        // Current observation: main_window is None
+        let current_identified_main_window: Option<&IdentifiedState> = None;
+        let reduced_fresh_state = false;
+
+        let should_save =
+            should_persist_observed_state(current_identified_main_window, reduced_fresh_state);
+        assert!(
+            !should_save,
+            "Must NOT save when current observation is unidentified"
+        );
+
+        // Execute save only if should_save (mirroring auth_status logic)
+        let mut loaded_ctx = Context::new(session.clone());
+        loaded_ctx.load(&conn);
+        if should_save {
+            loaded_ctx.save(&conn);
+        }
+
+        // Verify that updated_at was NOT touched (not rewritten as fresh)
+        let updated_at: String = conn
+            .query_row(
+                "SELECT updated_at FROM context WHERE session_id = ?1",
+                rusqlite::params![session.id],
+                |r| r.get(0),
+            )
+            .expect("query updated_at");
+        assert_eq!(updated_at, "2026-09-05 00:00:00");
+
+        // Verify that auth status is unknown rather than stale logged_in
+        let status = determine_auth_status(true, current_identified_main_window, None);
+        assert_eq!(status, "unknown");
+    }
+
+    #[test]
+    fn test_current_chat_state_persistence_works() {
+        let conn = setup_test_db();
+        let session = create_test_session("test-sess-chat");
+
+        let current_identified = IdentifiedState {
+            state_id: "chat".to_string(),
+            fsm: "mainWindow".to_string(),
+            frame: None,
+        };
+        let reduced_fresh_state = true;
+
+        assert!(should_persist_observed_state(
+            Some(&current_identified),
+            reduced_fresh_state
+        ));
+
+        let mut ctx = Context::new(session.clone());
+        ctx.state.main_window.view = MainWindowView::Chat;
+        ctx.state.main_window.is_logged_in = true;
+        ctx.save(&conn);
+
+        let mut verify_ctx = Context::new(session.clone());
+        verify_ctx.load(&conn);
+        assert_eq!(verify_ctx.state.main_window.view, MainWindowView::Chat);
+        assert!(verify_ctx.state.main_window.is_logged_in);
+
+        let status = determine_auth_status(
+            true,
+            Some(&current_identified),
+            Some(&ctx.state.main_window),
+        );
+        assert_eq!(status, "logged_in");
+    }
+
+    #[test]
+    fn test_current_login_account_state_persistence_works() {
+        let conn = setup_test_db();
+        let session = create_test_session("test-sess-login");
+
+        let current_identified = IdentifiedState {
+            state_id: "login_account".to_string(),
+            fsm: "mainWindow".to_string(),
+            frame: None,
+        };
+        let reduced_fresh_state = true;
+
+        assert!(should_persist_observed_state(
+            Some(&current_identified),
+            reduced_fresh_state
+        ));
+
+        let mut ctx = Context::new(session.clone());
+        ctx.state.main_window.view = MainWindowView::LoginAccount;
+        ctx.state.main_window.is_logged_in = false;
+        ctx.save(&conn);
+
+        let mut verify_ctx = Context::new(session.clone());
+        verify_ctx.load(&conn);
+        assert_eq!(
+            verify_ctx.state.main_window.view,
+            MainWindowView::LoginAccount
+        );
+        assert!(!verify_ctx.state.main_window.is_logged_in);
+
+        let status = determine_auth_status(
+            true,
+            Some(&current_identified),
+            Some(&ctx.state.main_window),
+        );
+        assert_eq!(status, "logged_out");
     }
 }

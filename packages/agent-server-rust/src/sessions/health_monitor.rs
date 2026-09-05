@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::ia::identify_states;
 use crate::sessions::manager::get_session;
@@ -35,6 +35,130 @@ pub enum HealthAction {
     RestartMissingProcess,
     Healthy,
     ObserveDegraded,
+}
+
+/// Reason why WeChat observation entered degraded mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DegradedReason {
+    A11yUnavailable,
+    Unidentified,
+}
+
+/// Internal health tracking state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackedHealthState {
+    Unknown,
+    Healthy,
+    Degraded(DegradedReason),
+}
+
+/// Pure logging decision produced by HealthLogTracker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogDecision {
+    /// First occurrence entering degraded state: emit WARN immediately.
+    WarnTransition { reason: DegradedReason },
+    /// Persistently degraded: emit rate-limited reminder WARN.
+    WarnPeriodicReminder {
+        reason: DegradedReason,
+        elapsed_secs: u64,
+        occurrences: u64,
+    },
+    /// Transitioned from Degraded back to Healthy: emit INFO recovery.
+    InfoRecovered { previous_reason: DegradedReason },
+    /// Suppress warning/info logs (healthy steady state or within throttle window).
+    Suppress,
+}
+
+/// State-transition and rate-limiting tracker for degraded health logs.
+#[derive(Debug, Clone)]
+pub struct HealthLogTracker {
+    state: TrackedHealthState,
+    degraded_since: Option<Instant>,
+    last_warn_at: Option<Instant>,
+    degraded_count: u64,
+    periodic_interval: Duration,
+}
+
+impl HealthLogTracker {
+    pub fn new(periodic_interval: Duration) -> Self {
+        Self {
+            state: TrackedHealthState::Unknown,
+            degraded_since: None,
+            last_warn_at: None,
+            degraded_count: 0,
+            periodic_interval,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.state = TrackedHealthState::Unknown;
+        self.degraded_since = None;
+        self.last_warn_at = None;
+        self.degraded_count = 0;
+    }
+
+    pub fn step(&mut self, obs: HealthObservation, now: Instant) -> LogDecision {
+        match obs {
+            HealthObservation::A11yUnavailable | HealthObservation::Unidentified => {
+                let reason = match obs {
+                    HealthObservation::A11yUnavailable => DegradedReason::A11yUnavailable,
+                    _ => DegradedReason::Unidentified,
+                };
+                self.degraded_count += 1;
+                match self.state {
+                    TrackedHealthState::Degraded(_) => {
+                        self.state = TrackedHealthState::Degraded(reason);
+                        let last = self.last_warn_at.unwrap_or(now);
+                        if now.duration_since(last) >= self.periodic_interval {
+                            self.last_warn_at = Some(now);
+                            let elapsed_secs = self
+                                .degraded_since
+                                .map(|s| now.duration_since(s).as_secs())
+                                .unwrap_or(0);
+                            LogDecision::WarnPeriodicReminder {
+                                reason,
+                                elapsed_secs,
+                                occurrences: self.degraded_count,
+                            }
+                        } else {
+                            LogDecision::Suppress
+                        }
+                    }
+                    _ => {
+                        self.state = TrackedHealthState::Degraded(reason);
+                        self.degraded_since = Some(now);
+                        self.last_warn_at = Some(now);
+                        LogDecision::WarnTransition { reason }
+                    }
+                }
+            }
+            HealthObservation::Identified => match self.state {
+                TrackedHealthState::Degraded(prev_reason) => {
+                    self.state = TrackedHealthState::Healthy;
+                    self.degraded_since = None;
+                    self.last_warn_at = None;
+                    self.degraded_count = 0;
+                    LogDecision::InfoRecovered {
+                        previous_reason: prev_reason,
+                    }
+                }
+                _ => {
+                    self.state = TrackedHealthState::Healthy;
+                    LogDecision::Suppress
+                }
+            },
+            HealthObservation::ProcessMissing => {
+                self.reset();
+                LogDecision::Suppress
+            }
+        }
+    }
+}
+
+impl Default for HealthLogTracker {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(60))
+    }
 }
 
 /// Decision function for health actions based on observation.
@@ -92,6 +216,7 @@ pub fn spawn_health_monitor() {
         let mut restart_count: u32 = 0;
         let mut window_start = Instant::now();
         let mut waiting_restart_since: Option<Instant> = None;
+        let mut log_tracker = HealthLogTracker::default();
 
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(SCAN_INTERVAL_SECS)).await;
@@ -121,6 +246,7 @@ pub fn spawn_health_monitor() {
                     let action = evaluate_health_action(HealthObservation::ProcessMissing);
                     debug_assert_eq!(action, HealthAction::RestartMissingProcess);
 
+                    log_tracker.reset();
                     if was_running {
                         tracing::warn!(
                             "[health] WeChat process disappeared (likely crashed), restarting"
@@ -171,23 +297,49 @@ pub fn spawn_health_monitor() {
                 Err(e) => {
                     let action = evaluate_health_action(HealthObservation::A11yUnavailable);
                     debug_assert_eq!(action, HealthAction::ObserveDegraded);
-                    tracing::warn!(
-                        "[health] WeChat (pid={}) a11y query failed: {}; observation degraded, continuing without kill",
-                        wechat_pid,
-                        e
-                    );
+                    match log_tracker.step(HealthObservation::A11yUnavailable, Instant::now()) {
+                        LogDecision::WarnTransition { .. } => {
+                            tracing::warn!(
+                                "[health] WeChat (pid={}) a11y query failed: {}; observation degraded, continuing without kill",
+                                wechat_pid,
+                                e
+                            );
+                        }
+                        LogDecision::WarnPeriodicReminder {
+                            elapsed_secs,
+                            occurrences,
+                            ..
+                        } => {
+                            tracing::warn!(
+                                "[health] WeChat (pid={}) observation still degraded (a11y failed: {}) for {}s ({} checks); continuing without kill",
+                                wechat_pid,
+                                e,
+                                elapsed_secs,
+                                occurrences
+                            );
+                        }
+                        LogDecision::InfoRecovered { .. } | LogDecision::Suppress => {}
+                    }
                     continue;
                 }
             };
 
-            let screenshot = capture_screenshot(&exec_options)
-                .await
-                .unwrap_or_default();
+            let screenshot = capture_screenshot(&exec_options).await.unwrap_or_default();
             let identified = identify_states(&a11y, &screenshot);
 
             if let Some(ref mw) = identified.main_window {
                 let action = evaluate_health_action(HealthObservation::Identified);
                 debug_assert_eq!(action, HealthAction::Healthy);
+                if let LogDecision::InfoRecovered { previous_reason } =
+                    log_tracker.step(HealthObservation::Identified, Instant::now())
+                {
+                    tracing::info!(
+                        "[health] WeChat (pid={}) observation recovered to healthy from {:?}: identified as {:?}",
+                        wechat_pid,
+                        previous_reason,
+                        mw.state_id
+                    );
+                }
                 tracing::debug!(
                     "[health] WeChat (pid={}) alive, UI state identified: {:?}",
                     wechat_pid,
@@ -196,10 +348,27 @@ pub fn spawn_health_monitor() {
             } else {
                 let action = evaluate_health_action(HealthObservation::Unidentified);
                 debug_assert_eq!(action, HealthAction::ObserveDegraded);
-                tracing::warn!(
-                    "[health] WeChat (pid={}) alive, but UI state unidentified; observation degraded, continuing without kill",
-                    wechat_pid
-                );
+                match log_tracker.step(HealthObservation::Unidentified, Instant::now()) {
+                    LogDecision::WarnTransition { .. } => {
+                        tracing::warn!(
+                            "[health] WeChat (pid={}) alive, but UI state unidentified; observation degraded, continuing without kill",
+                            wechat_pid
+                        );
+                    }
+                    LogDecision::WarnPeriodicReminder {
+                        elapsed_secs,
+                        occurrences,
+                        ..
+                    } => {
+                        tracing::warn!(
+                            "[health] WeChat (pid={}) observation still degraded (UI unidentified) for {}s ({} checks); continuing without kill",
+                            wechat_pid,
+                            elapsed_secs,
+                            occurrences
+                        );
+                    }
+                    LogDecision::InfoRecovered { .. } | LogDecision::Suppress => {}
+                }
             }
         }
     });
@@ -236,6 +405,153 @@ mod tests {
         assert_eq!(
             evaluate_health_action(HealthObservation::Identified),
             HealthAction::Healthy
+        );
+    }
+
+    #[test]
+    fn test_degraded_first_occurrence_logs_warn() {
+        let mut tracker = HealthLogTracker::default();
+        let now = Instant::now();
+
+        let decision = tracker.step(HealthObservation::A11yUnavailable, now);
+        assert_eq!(
+            decision,
+            LogDecision::WarnTransition {
+                reason: DegradedReason::A11yUnavailable
+            }
+        );
+    }
+
+    #[test]
+    fn test_repeated_degraded_observations_rate_limited() {
+        let mut tracker = HealthLogTracker::new(Duration::from_secs(60));
+        let start = Instant::now();
+
+        // First observation produces WarnTransition
+        let d0 = tracker.step(HealthObservation::Unidentified, start);
+        assert!(matches!(d0, LogDecision::WarnTransition { .. }));
+
+        // Rapid subsequent checks within 60s are suppressed
+        for sec in 1..60 {
+            let d = tracker.step(
+                HealthObservation::Unidentified,
+                start + Duration::from_secs(sec),
+            );
+            assert_eq!(
+                d,
+                LogDecision::Suppress,
+                "Second {sec} should be suppressed"
+            );
+        }
+
+        // At exactly 60s, emit periodic reminder
+        let d60 = tracker.step(
+            HealthObservation::Unidentified,
+            start + Duration::from_secs(60),
+        );
+        assert_eq!(
+            d60,
+            LogDecision::WarnPeriodicReminder {
+                reason: DegradedReason::Unidentified,
+                elapsed_secs: 60,
+                occurrences: 61,
+            }
+        );
+    }
+
+    #[test]
+    fn test_degraded_to_healthy_recovery_logs_info() {
+        let mut tracker = HealthLogTracker::default();
+        let start = Instant::now();
+
+        let _ = tracker.step(HealthObservation::A11yUnavailable, start);
+        let recovery = tracker.step(
+            HealthObservation::Identified,
+            start + Duration::from_secs(5),
+        );
+        assert_eq!(
+            recovery,
+            LogDecision::InfoRecovered {
+                previous_reason: DegradedReason::A11yUnavailable
+            }
+        );
+
+        // Further healthy steps remain suppressed (debug logging only)
+        let healthy_steady = tracker.step(
+            HealthObservation::Identified,
+            start + Duration::from_secs(6),
+        );
+        assert_eq!(healthy_steady, LogDecision::Suppress);
+    }
+
+    #[test]
+    fn test_degraded_ten_minutes_bounded_warnings() {
+        let mut tracker = HealthLogTracker::new(Duration::from_secs(60));
+        let start = Instant::now();
+        let mut warn_count = 0;
+
+        // 10 minutes = 600 seconds with 1 check per second
+        for sec in 0..=600 {
+            let d = tracker.step(
+                HealthObservation::Unidentified,
+                start + Duration::from_secs(sec),
+            );
+            match d {
+                LogDecision::WarnTransition { .. } | LogDecision::WarnPeriodicReminder { .. } => {
+                    warn_count += 1;
+                }
+                _ => {}
+            }
+        }
+
+        // In 600 seconds at 60s interval: exactly 11 warnings (t=0, 60, 120, ..., 600)
+        assert_eq!(warn_count, 11);
+        assert!(
+            warn_count <= 600,
+            "10-minute warnings must be bounded <= 600"
+        );
+    }
+
+    #[test]
+    fn test_alternating_degraded_reasons_stay_rate_limited() {
+        let mut tracker = HealthLogTracker::new(Duration::from_secs(60));
+        let start = Instant::now();
+
+        // t=0: A11yUnavailable
+        let d0 = tracker.step(HealthObservation::A11yUnavailable, start);
+        assert!(matches!(d0, LogDecision::WarnTransition { .. }));
+
+        // t=1: Unidentified (flicker between degraded modes)
+        let d1 = tracker.step(
+            HealthObservation::Unidentified,
+            start + Duration::from_secs(1),
+        );
+        // Must remain suppressed, not trigger a new WarnTransition every second
+        assert_eq!(d1, LogDecision::Suppress);
+    }
+
+    #[test]
+    fn test_process_missing_resets_tracker() {
+        let mut tracker = HealthLogTracker::default();
+        let start = Instant::now();
+
+        let _ = tracker.step(HealthObservation::A11yUnavailable, start);
+        let d_missing = tracker.step(
+            HealthObservation::ProcessMissing,
+            start + Duration::from_secs(2),
+        );
+        assert_eq!(d_missing, LogDecision::Suppress);
+
+        // After process missing resets tracker, a subsequent degraded observation logs a fresh transition
+        let d_fresh = tracker.step(
+            HealthObservation::Unidentified,
+            start + Duration::from_secs(10),
+        );
+        assert_eq!(
+            d_fresh,
+            LogDecision::WarnTransition {
+                reason: DegradedReason::Unidentified
+            }
         );
     }
 }
