@@ -54,8 +54,14 @@ pub fn build_router() -> Router {
         .route("/api/debug/screenshot", get(debug::screenshot))
         .route("/api/debug/a11y", get(debug::a11y))
         // Sessions
-        .route("/api/sessions", get(sessions::list_sessions).post(sessions::create_session))
-        .route("/api/sessions/{id}", get(sessions::get_session).delete(sessions::delete_session))
+        .route(
+            "/api/sessions",
+            get(sessions::list_sessions).post(sessions::create_session),
+        )
+        .route(
+            "/api/sessions/{id}",
+            get(sessions::get_session).delete(sessions::delete_session),
+        )
         .route("/api/sessions/{id}/start", post(sessions::start_session))
         .route("/api/sessions/{id}/stop", post(sessions::stop_session))
         // WebSocket for login subscription

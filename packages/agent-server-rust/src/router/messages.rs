@@ -10,11 +10,11 @@ use crate::db::get_db;
 use crate::execution::run_execution_loop;
 use crate::ia::types::{MediaResult, Message, SendResult, SubscriptionEvent};
 use crate::plans::send_message::{SendMessageParams, SendMessagePlan};
+use crate::sessions::manager::get_session;
 use crate::tools::wechat_db::{find_wechat_pid, list_account_dbs};
-use crate::tools::wechat_keys::{extract_keys_async, get_stored_keys, get_image_keys, store_keys};
+use crate::tools::wechat_keys::{extract_keys_async, get_image_keys, get_stored_keys, store_keys};
 use crate::tools::wechat_media::get_message_media;
 use crate::tools::wechat_messages;
-use crate::sessions::manager::get_session;
 
 #[derive(Deserialize)]
 pub struct ListParams {
@@ -66,7 +66,12 @@ pub async fn list_messages(
         }
     }
 
-    if !keys.keys().any(|k| k.starts_with("message_") && k.ends_with(".db") && !k.contains("fts") && !k.contains("resource")) {
+    if !keys.keys().any(|k| {
+        k.starts_with("message_")
+            && k.ends_with(".db")
+            && !k.contains("fts")
+            && !k.contains("resource")
+    }) {
         return Json(Vec::new());
     }
 
@@ -196,9 +201,17 @@ pub async fn send_message(Json(input): Json<SendParams>) -> Json<SendResult> {
             "image/gif" => ".gif",
             _ => ".png",
         };
-        let path = format!("/tmp/send_image_{}{}", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis(), ext);
-        if let Ok(bytes) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &img.data) {
+        let path = format!(
+            "/tmp/send_image_{}{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+            ext
+        );
+        if let Ok(bytes) =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &img.data)
+        {
             if std::fs::write(&path, &bytes).is_ok() {
                 image_mime = Some(img.mime_type.clone());
                 image_path = Some(path);
@@ -214,18 +227,30 @@ pub async fn send_message(Json(input): Json<SendParams>) -> Json<SendResult> {
         // path stays portable across locales.  The dot is preserved so that
         // file extensions survive (e.g. "遗憾.pdf" → "__.pdf"); the mangled
         // stem is acceptable since this is a transient temp path.
-        let safe_name: String = f.filename.chars().map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        }).collect();
-        let path = format!("/tmp/send_file_{}_{}", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis(), safe_name);
+        let safe_name: String = f
+            .filename
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let path = format!(
+            "/tmp/send_file_{}_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+            safe_name
+        );
         match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &f.data) {
             Ok(bytes) => match std::fs::write(&path, &bytes) {
-                Ok(_) => { file_path = Some(path); }
+                Ok(_) => {
+                    file_path = Some(path);
+                }
                 Err(e) => {
                     return Json(SendResult {
                         success: false,

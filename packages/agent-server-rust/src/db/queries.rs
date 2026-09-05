@@ -57,7 +57,11 @@ pub fn update_session_logged_in_user(
     logged_in_user: Option<&str>,
 ) {
     let now = chrono::Utc::now().to_rfc3339();
-    let login_state = if logged_in_user.is_some() { "logged_in" } else { "logged_out" };
+    let login_state = if logged_in_user.is_some() {
+        "logged_in"
+    } else {
+        "logged_out"
+    };
     conn.execute(
         "UPDATE sessions SET logged_in_user = ?1, login_state = ?2, updated_at = ?3 WHERE id = ?4",
         params![logged_in_user, login_state, now, session_id],
