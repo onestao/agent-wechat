@@ -1,0 +1,322 @@
+# R2: Formal, reproducible publish pipeline for the WeChat Hub AgentWechat image.
+#
+# Publish target (HARDCODED — must NEVER be ghcr.io/onestao/agent-wechat):
+#   ghcr.io/onestao/wechat-hub-agent-wechat
+#
+# Guarantees enforced by this workflow:
+#   - workflow_dispatch only; the source of a release is an explicit full
+#     40-char commit SHA (inputs.source_commit). Branch names are rejected.
+#   - Tag immutability (fail-closed): if the requested tag already exists on
+#     GHCR the workflow refuses to build/push/overwrite/delete. Registry errors
+#     (auth/network) are treated as "undetermined" and also fail the run.
+#     GHCR tags are mutable at the registry level, so the absence check runs
+#     twice (preflight + immediately before push) and a per-tag concurrency
+#     group serializes runs. This workflow never pushes :latest.
+#   - Preflight: cargo fmt --check / cargo check --locked / cargo test --locked
+#     must pass in packages/agent-server-rust before any build.
+#   - Source provenance baked into OCI labels:
+#       org.opencontainers.image.revision   = SOURCE_COMMIT
+#       com.wechat-hub.upstream-base-commit = upstream base commit (verified
+#         against the commit resolved from upstream_base_tag)
+#       com.wechat-hub.upstream-base-tag    = upstream base tag
+#   - Build recipe is version-controlled: docker/Dockerfile +
+#     scripts/ci/prepare-docker-context.sh. There is no NAS-local ad-hoc
+#     Dockerfile in this pipeline.
+#   - Platform: linux/amd64 only (arm64 intentionally not published; the
+#     WeChat Hub canary environment is amd64 — do not add unverified multiarch).
+#
+# GHCR note: GITHUB_TOKEN can access packages linked to this repository. If the
+# tag-absence check fails with an auth error, link the
+# wechat-hub-agent-wechat package to onestao/agent-wechat (or grant this repo
+# access) instead of weakening the check.
+
+name: Publish AgentWechat (wechat-hub)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Immutable image tag, e.g. 0.11.15-wh.2 (must NOT already exist on GHCR)"
+        required: true
+        type: string
+      source_commit:
+        description: "Full 40-char commit SHA to publish (source of truth for this release)"
+        required: true
+        type: string
+      upstream_base_commit:
+        description: "Upstream base commit (verified against upstream_base_tag, recorded as OCI label)"
+        required: false
+        type: string
+        default: "3b7de890eb1fd3a16cf9cf26dbe1c20e0f88a616"
+      upstream_base_tag:
+        description: "Upstream base tag (must exist as a git tag in this repo)"
+        required: false
+        type: string
+        default: "v0.11.15"
+      dry_run:
+        description: "Run preflight + image build but DO NOT push (pipeline validation)"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: publish-agent-wechat-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/onestao/wechat-hub-agent-wechat
+  PLATFORMS: linux/amd64
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  preflight:
+    name: Preflight (inputs, immutability, cargo)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      source_commit: ${{ steps.pin.outputs.source_commit }}
+      release_tag: ${{ steps.validate-tag.outputs.release_tag }}
+      image: ${{ steps.validate-tag.outputs.image }}
+      upstream_base_commit: ${{ steps.verify-base.outputs.upstream_base_commit }}
+      upstream_base_tag: ${{ steps.verify-base.outputs.upstream_base_tag }}
+    steps:
+      # Raw inputs are only ever consumed through env vars, never interpolated
+      # directly into shell commands (injection-safe pattern).
+      - name: Validate inputs (fail fast, pre-checkout)
+        env:
+          SOURCE_COMMIT_INPUT: ${{ inputs.source_commit }}
+          UPSTREAM_BASE_COMMIT_INPUT: ${{ inputs.upstream_base_commit }}
+          UPSTREAM_BASE_TAG_INPUT: ${{ inputs.upstream_base_tag }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$SOURCE_COMMIT_INPUT" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::source_commit must be a full 40-char commit SHA, got: '$SOURCE_COMMIT_INPUT' (branch names are not accepted)"
+            exit 1
+          fi
+          if ! [[ "$UPSTREAM_BASE_COMMIT_INPUT" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::upstream_base_commit must be a full 40-char commit SHA, got: '$UPSTREAM_BASE_COMMIT_INPUT'"
+            exit 1
+          fi
+          case "$UPSTREAM_BASE_TAG_INPUT" in
+            v[0-9]*) : ;;
+            *) echo "::error::upstream_base_tag must look like v<semver>, got: '$UPSTREAM_BASE_TAG_INPUT'"; exit 1 ;;
+          esac
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Pin source commit
+        id: pin
+        env:
+          SOURCE_COMMIT_INPUT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          scripts/ci/verify-source-commit.sh "$SOURCE_COMMIT_INPUT"
+          echo "source_commit=$(git rev-parse 'HEAD^{commit}')" >> "$GITHUB_OUTPUT"
+
+      - name: Validate release tag
+        id: validate-tag
+        env:
+          RELEASE_TAG_INPUT: ${{ inputs.release_tag }}
+          UPSTREAM_BASE_TAG_INPUT: ${{ inputs.upstream_base_tag }}
+        run: |
+          set -euo pipefail
+          scripts/ci/validate-release-tag.sh "$RELEASE_TAG_INPUT" "$UPSTREAM_BASE_TAG_INPUT"
+          {
+            echo "release_tag=$RELEASE_TAG_INPUT"
+            echo "image=${IMAGE}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify upstream base commit matches base tag
+        id: verify-base
+        env:
+          UPSTREAM_BASE_COMMIT_INPUT: ${{ inputs.upstream_base_commit }}
+          UPSTREAM_BASE_TAG_INPUT: ${{ inputs.upstream_base_tag }}
+        run: |
+          set -euo pipefail
+          RESOLVED="$(git rev-parse "${UPSTREAM_BASE_TAG_INPUT}^{commit}")"
+          LOWER_INPUT="$(printf '%s' "$UPSTREAM_BASE_COMMIT_INPUT" | tr 'A-Z' 'a-z')"
+          if [ "$RESOLVED" != "$LOWER_INPUT" ]; then
+            echo "::error::upstream_base_commit ($LOWER_INPUT) does not match commit resolved from ${UPSTREAM_BASE_TAG_INPUT} ($RESOLVED)"
+            exit 1
+          fi
+          echo "upstream base verified: ${UPSTREAM_BASE_TAG_INPUT} -> $RESOLVED"
+          {
+            echo "upstream_base_commit=$RESOLVED"
+            echo "upstream_base_tag=$UPSTREAM_BASE_TAG_INPUT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify build recipe is present in source commit
+        run: |
+          set -euo pipefail
+          test -f docker/Dockerfile
+          test -f docker/entrypoint.sh
+          test -f docker/.dockerignore
+          test -d packages/agent-server-rust/src
+          test -f packages/agent-server-rust/Cargo.lock
+          echo "build recipe OK: docker/Dockerfile + packages/agent-server-rust present"
+
+      # skopeo is preinstalled on GitHub-hosted ubuntu runners; the guard keeps
+      # the workflow usable on other runners.
+      - name: Check tag absence on GHCR (fail-closed immutability)
+        env:
+          RELEASE_TAG_INPUT: ${{ steps.validate-tag.outputs.release_tag }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          command -v skopeo >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y skopeo; }
+          scripts/ci/ensure-tag-absent.sh "${IMAGE}:${RELEASE_TAG_INPUT}" --creds "${REGISTRY_USER}:${REGISTRY_TOKEN}"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: packages/agent-server-rust
+
+      - name: cargo fmt --check
+        run: cargo fmt --check --manifest-path packages/agent-server-rust/Cargo.toml
+
+      - name: cargo check
+        run: cargo check --locked --manifest-path packages/agent-server-rust/Cargo.toml
+
+      - name: cargo test
+        run: cargo test --locked --manifest-path packages/agent-server-rust/Cargo.toml
+
+  publish:
+    name: Build & publish (${{ needs.preflight.outputs.release_tag }})
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      digest: ${{ steps.verify-published.outputs.digest }}
+    env:
+      SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+      RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
+      UPSTREAM_BASE_COMMIT: ${{ needs.preflight.outputs.upstream_base_commit }}
+      UPSTREAM_BASE_TAG: ${{ needs.preflight.outputs.upstream_base_tag }}
+      REGISTRY_USER: ${{ github.actor }}
+      REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.source_commit }}
+          persist-credentials: false
+
+      - name: Re-verify pinned source commit
+        env:
+          SOURCE_COMMIT_INPUT: ${{ needs.preflight.outputs.source_commit }}
+        run: scripts/ci/verify-source-commit.sh "$SOURCE_COMMIT_INPUT"
+
+      # Narrow the tag-immutability race window: re-check absence immediately
+      # before the build/push. A concurrent push between this check and the
+      # push step is the only residual race; the per-tag concurrency group
+      # serializes runs of this workflow, which is the practical defense.
+      - name: Re-check tag absence (fail-closed immutability)
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          command -v skopeo >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y skopeo; }
+          scripts/ci/ensure-tag-absent.sh "${IMAGE}:${RELEASE_TAG}" --creds "${REGISTRY_USER}:${REGISTRY_TOKEN}"
+
+      - name: Prepare docker build context
+        run: scripts/ci/prepare-docker-context.sh
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        if: ${{ !inputs.dry_run }}
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Record build timestamp
+        id: ts
+        run: echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: docker
+          file: docker/Dockerfile
+          platforms: ${{ env.PLATFORMS }}
+          # dry_run builds the full image locally but pushes nothing.
+          push: ${{ !inputs.dry_run }}
+          # Keep the pushed manifest a plain single-platform image so the
+          # reported digest matches what deployments pin.
+          provenance: false
+          sbom: false
+          tags: ${{ env.IMAGE }}:${{ env.RELEASE_TAG }}
+          build-args: |
+            BUILD_MODE=release
+          labels: |
+            org.opencontainers.image.revision=${{ env.SOURCE_COMMIT }}
+            org.opencontainers.image.source=https://github.com/onestao/agent-wechat
+            org.opencontainers.image.version=${{ env.RELEASE_TAG }}
+            org.opencontainers.image.created=${{ steps.ts.outputs.created }}
+            com.wechat-hub.upstream-base-commit=${{ env.UPSTREAM_BASE_COMMIT }}
+            com.wechat-hub.upstream-base-tag=${{ env.UPSTREAM_BASE_TAG }}
+            com.wechat-hub.source-commit=${{ env.SOURCE_COMMIT }}
+          cache-from: type=gha,scope=agent-wechat-publish-amd64
+          cache-to: type=gha,scope=agent-wechat-publish-amd64,mode=max
+
+      - name: Verify published tag resolves to the built digest
+        id: verify-published
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          BUILT="${{ steps.build.outputs.digest }}"
+          if [ -z "$BUILT" ]; then
+            echo "::error::build-push-action did not report a digest"
+            exit 1
+          fi
+          PUBLISHED="$(docker buildx imagetools inspect "${IMAGE}:${RELEASE_TAG}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          if [ "$PUBLISHED" != "$BUILT" ]; then
+            echo "::error::published tag ${IMAGE}:${RELEASE_TAG} resolves to $PUBLISHED but build reported $BUILT"
+            exit 1
+          fi
+          echo "digest=$BUILT" >> "$GITHUB_OUTPUT"
+
+      - name: Write release summary
+        env:
+          BUILT_DIGEST: ${{ steps.build.outputs.digest }}
+          PUBLISHED_DIGEST: ${{ steps.verify-published.outputs.digest }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## AgentWechat publish: ${IMAGE}:${RELEASE_TAG}"
+            if [ "${{ inputs.dry_run }}" = "true" ]; then
+              echo ""
+              echo "> **DRY RUN** — image was built but NOT pushed."
+            fi
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| source commit | \`${SOURCE_COMMIT}\` |"
+            echo "| upstream base | \`${UPSTREAM_BASE_TAG}\` (\`${UPSTREAM_BASE_COMMIT}\`) |"
+            echo "| tag | \`${RELEASE_TAG}\` |"
+            echo "| image | \`${IMAGE}\` |"
+            echo "| platform | \`${PLATFORMS}\` |"
+            echo "| OCI revision | \`${SOURCE_COMMIT}\` |"
+            if [ -n "$PUBLISHED_DIGEST" ]; then
+              echo "| manifest digest | \`$PUBLISHED_DIGEST\` |"
+            elif [ -n "$BUILT_DIGEST" ]; then
+              echo "| built digest (not pushed) | \`$BUILT_DIGEST\` |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
