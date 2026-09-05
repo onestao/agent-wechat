@@ -1,0 +1,4 @@
+# Pin LF for the publish pipeline scripts — bash on Linux runners breaks on CRLF.
+scripts/ci/*.sh text eol=lf
+scripts/ci/README.md text eol=lf
+.github/workflows/*.yml text eol=lf
