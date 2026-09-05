@@ -59,17 +59,28 @@ impl IAState for LoginAccountState {
 
     fn identify(&self, args: &IdentifyArgs) -> Result<IdentifyResult, String> {
         let log_in_btn = query_selector(args.a11y, r#"push-button[name="Log In"]"#)
-            .or_else(|| query_selector(args.a11y, r#"push-button[name="Open WeChat"]"#));
+            .or_else(|| query_selector(args.a11y, r#"push-button[name="Open WeChat"]"#))
+            .or_else(|| query_selector(args.a11y, r#"push-button[name="Enter Weixin"]"#));
         if log_in_btn.is_none() {
             return Ok(IdentifyResult { identified: false, frame: None });
         }
 
         let has_switch = query_selector(args.a11y, r#"push-button[name="Switch Account"]"#).is_some();
-        if !has_switch {
+        let has_wechat_context = query_selector(args.a11y, r#"frame[name="Weixin"]"#).is_some()
+            || query_selector(args.a11y, r#"frame[name="WeChat"]"#).is_some()
+            || query_selector(args.a11y, r#"application[name="wechat"]"#).is_some()
+            || query_selector(args.a11y, r#"label[name*="Current User"]"#).is_some();
+
+        if !has_switch && !has_wechat_context {
             return Ok(IdentifyResult { identified: false, frame: None });
         }
 
-        Ok(IdentifyResult { identified: true, frame: find_frame_for(args.a11y, r#"push-button[name="Switch Account"]"#) })
+        let frame = find_frame_for(args.a11y, r#"push-button[name="Enter Weixin"]"#)
+            .or_else(|| find_frame_for(args.a11y, r#"push-button[name="Log In"]"#))
+            .or_else(|| find_frame_for(args.a11y, r#"push-button[name="Open WeChat"]"#))
+            .or_else(|| find_frame_for(args.a11y, r#"push-button[name="Switch Account"]"#));
+
+        Ok(IdentifyResult { identified: true, frame })
     }
 
     fn reduce(&self, args: &ReduceArgs) -> AppState {
@@ -192,3 +203,39 @@ pub static LOGIN_STATES: std::sync::LazyLock<Vec<Box<dyn IAState>>> = std::sync:
         Box::new(LoginLoadingState),
     ]
 });
+
+#[cfg(test)]
+mod tests {
+    use crate::ia::actions::click_login;
+    use crate::ia::identify_states;
+    use crate::ia::selectors::query_selector;
+    use crate::ia::types::{A11yNode, Action};
+
+    fn load_fixture(name: &str) -> A11yNode {
+        let json = match name {
+            "login_enter_weixin.json" => include_str!("test_fixtures/login_enter_weixin.json"),
+            _ => panic!("Unknown fixture: {name}"),
+        };
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn test_identify_enter_weixin_fixture() {
+        let tree = load_fixture("login_enter_weixin.json");
+        let identified = identify_states(&tree, "");
+
+        assert!(identified.main_window.is_some(), "Expected main_window to be identified");
+        let mw = identified.main_window.unwrap();
+        assert_eq!(mw.state_id, "login_account", "State must be login_account");
+
+        // Verify that click_login action selector targets the Enter Weixin button in this fixture
+        let action = click_login();
+        if let Action::ClickSelector { selector } = action {
+            let matched_btn = query_selector(&tree, &selector);
+            assert!(matched_btn.is_some(), "click_login selector must match button in fixture");
+            assert_eq!(matched_btn.unwrap().name, "Enter Weixin");
+        } else {
+            panic!("Expected click_login to be Action::ClickSelector");
+        }
+    }
+}

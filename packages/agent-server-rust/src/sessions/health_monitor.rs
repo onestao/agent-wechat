@@ -11,9 +11,6 @@ use crate::tools::wechat_db::find_wechat_pid;
 /// How often to run the health scan (in seconds).
 const SCAN_INTERVAL_SECS: u64 = 1;
 
-/// Kill WeChat if no IA state has been identified for this long (in seconds).
-const UNRESPONSIVE_TIMEOUT_SECS: u64 = 60;
-
 /// Delay before restarting WeChat after a crash (in seconds).
 const RESTART_DELAY_SECS: u64 = 3;
 
@@ -21,6 +18,35 @@ const RESTART_DELAY_SECS: u64 = 3;
 const MAX_RAPID_RESTARTS: u32 = 5;
 const RAPID_WINDOW_SECS: u64 = 60;
 const BACKOFF_DELAY_SECS: u64 = 30;
+
+/// Pure representation of health observation for decision testing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthObservation {
+    ProcessMissing,
+    A11yUnavailable,
+    Identified,
+    Unidentified,
+}
+
+/// Pure representation of permitted health actions.
+/// Note: Destructive kills of running processes are intentionally absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthAction {
+    RestartMissingProcess,
+    Healthy,
+    ObserveDegraded,
+}
+
+/// Decision function for health actions based on observation.
+pub fn evaluate_health_action(obs: HealthObservation) -> HealthAction {
+    match obs {
+        HealthObservation::ProcessMissing => HealthAction::RestartMissingProcess,
+        HealthObservation::Identified => HealthAction::Healthy,
+        HealthObservation::A11yUnavailable | HealthObservation::Unidentified => {
+            HealthAction::ObserveDegraded
+        }
+    }
+}
 
 /// Global flag to pause health monitoring during active execution loops.
 static MONITORING_PAUSED: AtomicBool = AtomicBool::new(false);
@@ -55,13 +81,13 @@ fn spawn_wechat(session: &crate::ia::types::Session) {
 /// Spawn the background health monitor task.
 ///
 /// Every second, it checks the default session's WeChat process by running
-/// a11y → identify. If WeChat has crashed, it restarts it. If no IA state
-/// has been identified for more than 60 seconds, it kills and restarts it.
+/// a11y → identify. If WeChat has crashed, it restarts it.
+/// If a11y fails or UI state is unidentified while the process is still running,
+/// it logs a degraded observation and continues observing without killing.
 pub fn spawn_health_monitor() {
     tokio::spawn(async move {
-        tracing::info!("[health] WeChat health monitor started");
+        tracing::info!("[health] WeChat health monitor started (non-destructive UI observation)");
 
-        let mut last_identified = Instant::now();
         let mut was_running = false;
         let mut restart_count: u32 = 0;
         let mut window_start = Instant::now();
@@ -72,17 +98,13 @@ pub fn spawn_health_monitor() {
 
             // Skip if monitoring is paused (an execution loop is active)
             if MONITORING_PAUSED.load(Ordering::Relaxed) {
-                last_identified = Instant::now();
                 continue;
             }
 
             // Only monitor the default session
             let session = match get_session("default") {
                 Some(s) if s.status == "running" => s,
-                _ => {
-                    last_identified = Instant::now();
-                    continue;
-                }
+                _ => continue,
             };
 
             // Check if WeChat process is even running
@@ -96,6 +118,9 @@ pub fn spawn_health_monitor() {
                     pid
                 }
                 None => {
+                    let action = evaluate_health_action(HealthObservation::ProcessMissing);
+                    debug_assert_eq!(action, HealthAction::RestartMissingProcess);
+
                     if was_running {
                         tracing::warn!(
                             "[health] WeChat process disappeared (likely crashed), restarting"
@@ -131,12 +156,11 @@ pub fn spawn_health_monitor() {
                         }
                     }
 
-                    last_identified = Instant::now();
                     continue;
                 }
             };
 
-            // Run a11y + identify to see if we can detect any state
+            // Run a11y + identify to observe state
             let exec_options = ExecOptions {
                 session: Some(session.clone()),
                 timeout_ms: 10_000,
@@ -144,9 +168,14 @@ pub fn spawn_health_monitor() {
 
             let a11y = match get_a11y_desktop(&exec_options).await {
                 Ok(tree) => tree,
-                Err(_) => {
-                    // a11y failed — count as unresponsive, don't reset timer
-                    check_and_kill(wechat_pid, &last_identified);
+                Err(e) => {
+                    let action = evaluate_health_action(HealthObservation::A11yUnavailable);
+                    debug_assert_eq!(action, HealthAction::ObserveDegraded);
+                    tracing::warn!(
+                        "[health] WeChat (pid={}) a11y query failed: {}; observation degraded, continuing without kill",
+                        wechat_pid,
+                        e
+                    );
                     continue;
                 }
             };
@@ -156,54 +185,57 @@ pub fn spawn_health_monitor() {
                 .unwrap_or_default();
             let identified = identify_states(&a11y, &screenshot);
 
-            if identified.main_window.is_some() {
-                // State identified — WeChat is responsive
-                last_identified = Instant::now();
+            if let Some(ref mw) = identified.main_window {
+                let action = evaluate_health_action(HealthObservation::Identified);
+                debug_assert_eq!(action, HealthAction::Healthy);
+                tracing::debug!(
+                    "[health] WeChat (pid={}) alive, UI state identified: {:?}",
+                    wechat_pid,
+                    mw.state_id
+                );
             } else {
-                // No state identified — check timeout
-                check_and_kill(wechat_pid, &last_identified);
+                let action = evaluate_health_action(HealthObservation::Unidentified);
+                debug_assert_eq!(action, HealthAction::ObserveDegraded);
+                tracing::warn!(
+                    "[health] WeChat (pid={}) alive, but UI state unidentified; observation degraded, continuing without kill",
+                    wechat_pid
+                );
             }
         }
     });
 }
 
-/// If time since last identified state exceeds the timeout, kill the WeChat process.
-fn check_and_kill(wechat_pid: i64, last_identified: &Instant) {
-    let elapsed = last_identified.elapsed();
-    if elapsed.as_secs() >= UNRESPONSIVE_TIMEOUT_SECS {
-        tracing::warn!(
-            "[health] WeChat (pid={}) unresponsive for {}s, killing process",
-            wechat_pid,
-            elapsed.as_secs()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_health_action_process_missing() {
+        assert_eq!(
+            evaluate_health_action(HealthObservation::ProcessMissing),
+            HealthAction::RestartMissingProcess
         );
+    }
 
-        let result = std::process::Command::new("kill")
-            .args(["-9", &wechat_pid.to_string()])
-            .output();
+    #[test]
+    fn test_health_action_a11y_unavailable_never_kills() {
+        let action = evaluate_health_action(HealthObservation::A11yUnavailable);
+        assert_eq!(action, HealthAction::ObserveDegraded);
+        assert_ne!(action, HealthAction::RestartMissingProcess);
+    }
 
-        match result {
-            Ok(output) if output.status.success() => {
-                tracing::info!(
-                    "[health] Killed WeChat pid={}, will restart automatically",
-                    wechat_pid
-                );
-            }
-            Ok(output) => {
-                tracing::warn!(
-                    "[health] kill returned non-zero for pid={}: {}",
-                    wechat_pid,
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-            Err(e) => {
-                tracing::error!("[health] Failed to kill WeChat pid={}: {}", wechat_pid, e);
-            }
-        }
-    } else {
-        tracing::debug!(
-            "[health] WeChat unresponsive for {}s (threshold: {}s)",
-            elapsed.as_secs(),
-            UNRESPONSIVE_TIMEOUT_SECS
+    #[test]
+    fn test_health_action_unidentified_ui_never_kills() {
+        let action = evaluate_health_action(HealthObservation::Unidentified);
+        assert_eq!(action, HealthAction::ObserveDegraded);
+        assert_ne!(action, HealthAction::RestartMissingProcess);
+    }
+
+    #[test]
+    fn test_health_action_identified() {
+        assert_eq!(
+            evaluate_health_action(HealthObservation::Identified),
+            HealthAction::Healthy
         );
     }
 }

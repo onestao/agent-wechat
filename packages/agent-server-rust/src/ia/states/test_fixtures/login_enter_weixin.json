@@ -1,0 +1,36 @@
+{
+  "role": "desktop-frame",
+  "name": "main",
+  "children": [
+    {
+      "role": "application",
+      "name": "wechat",
+      "children": [
+        {
+          "role": "frame",
+          "name": "Weixin",
+          "bounds": { "x": 100, "y": 100, "width": 280, "height": 400 },
+          "children": [
+            {
+              "role": "label",
+              "name": "Current User Test Operator",
+              "bounds": { "x": 140, "y": 220, "width": 100, "height": 20 }
+            },
+            {
+              "role": "push-button",
+              "name": "Enter Weixin",
+              "bounds": { "x": 140, "y": 280, "width": 100, "height": 36 },
+              "children": [
+                {
+                  "role": "label",
+                  "name": "Enter Weixin",
+                  "bounds": { "x": 140, "y": 280, "width": 100, "height": 36 }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

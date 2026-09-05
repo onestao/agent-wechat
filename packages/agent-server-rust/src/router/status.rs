@@ -31,6 +31,44 @@ pub async fn get_status() -> Json<serde_json::Value> {
     }))
 }
 
+/// Pure function to determine auth status from process existence, current observation, and reduced state.
+///
+/// Semantics:
+/// - If process is not running, status is "app_not_running".
+/// - If process is running, but current observation has no identified main window (e.g. unknown state,
+///   a11y error, or unidentified screen), status is "unknown" (never stale persisted "logged_in").
+/// - Only when current observation identifies a Chat / ChatOpen view does status become "logged_in".
+/// - When current observation identifies a login state (LoginAccount, LoginQr, LoginPhoneConfirm, etc.),
+///   status is "logged_out".
+pub fn determine_auth_status(
+    has_process: bool,
+    current_identified_main_window: Option<&crate::ia::types::IdentifiedState>,
+    current_reduced_main_window: Option<&crate::ia::types::MainWindowState>,
+) -> &'static str {
+    if !has_process {
+        return "app_not_running";
+    }
+
+    match current_identified_main_window {
+        None => "unknown",
+        Some(_) => {
+            if let Some(mw) = current_reduced_main_window {
+                match mw.view {
+                    crate::ia::types::MainWindowView::Chat
+                    | crate::ia::types::MainWindowView::ChatOpen => "logged_in",
+                    crate::ia::types::MainWindowView::LoginQr
+                    | crate::ia::types::MainWindowView::LoginAccount
+                    | crate::ia::types::MainWindowView::LoginPhoneConfirm
+                    | crate::ia::types::MainWindowView::LoginLoading
+                    | crate::ia::types::MainWindowView::NetworkProxySettings => "logged_out",
+                }
+            } else {
+                "unknown"
+            }
+        }
+    }
+}
+
 /// Check auth status via one FSM observation cycle.
 ///
 /// Gets the a11y tree, identifies the current state, and runs
@@ -100,11 +138,15 @@ pub async fn auth_status() -> Json<serde_json::Value> {
         context.save(&db);
     }
 
-    let status = if context.state.main_window.is_logged_in {
-        "logged_in"
-    } else {
-        "logged_out"
-    };
+    let status = determine_auth_status(
+        wechat_running,
+        identified.main_window.as_ref(),
+        if identified.main_window.is_some() {
+            Some(&context.state.main_window)
+        } else {
+            None
+        },
+    );
 
     tracing::info!(
         "[auth_status] view={:?}, status={}",
@@ -416,5 +458,65 @@ fn subscription_event_to_login_event(event: SubscriptionEvent) -> LoginSubscript
         _ => LoginSubscriptionEvent::Status {
             message: format!("Unknown event: {}", event.event_type),
         },
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ia::types::{AppState, IdentifiedState, MainWindowView};
+
+    #[test]
+    fn test_a_persisted_chat_current_unidentified_returns_unknown() {
+        // Persisted context was Chat / logged_in, but current observation has no identified main window
+        let has_process = true;
+        let current_identified = None;
+        let current_reduced = None;
+
+        let status = determine_auth_status(has_process, current_identified, current_reduced);
+        assert_ne!(status, "logged_in", "Unidentified observation must not return logged_in");
+        assert_eq!(status, "unknown");
+    }
+
+    #[test]
+    fn test_b_persisted_chat_current_login_account_returns_logged_out() {
+        // Persisted context was Chat, but current observation identified LoginAccount (e.g. Enter Weixin)
+        let has_process = true;
+        let current_identified = Some(IdentifiedState {
+            state_id: "login_account".to_string(),
+            fsm: "mainWindow".to_string(),
+            frame: None,
+        });
+        let mut current_reduced = AppState::default().main_window;
+        current_reduced.view = MainWindowView::LoginAccount;
+        current_reduced.is_logged_in = false;
+
+        let status = determine_auth_status(has_process, current_identified.as_ref(), Some(&current_reduced));
+        assert_ne!(status, "logged_in", "LoginAccount observation must not return logged_in");
+        assert_eq!(status, "logged_out");
+    }
+
+    #[test]
+    fn test_c_current_chat_returns_logged_in() {
+        // Current observation identified Chat
+        let has_process = true;
+        let current_identified = Some(IdentifiedState {
+            state_id: "chat".to_string(),
+            fsm: "mainWindow".to_string(),
+            frame: None,
+        });
+        let mut current_reduced = AppState::default().main_window;
+        current_reduced.view = MainWindowView::Chat;
+        current_reduced.is_logged_in = true;
+
+        let status = determine_auth_status(has_process, current_identified.as_ref(), Some(&current_reduced));
+        assert_eq!(status, "logged_in");
+    }
+
+    #[test]
+    fn test_process_not_running_returns_app_not_running() {
+        let status = determine_auth_status(false, None, None);
+        assert_eq!(status, "app_not_running");
     }
 }
