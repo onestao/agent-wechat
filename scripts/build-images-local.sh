@@ -56,7 +56,7 @@ build_arch() {
   local tag="$2"
 
   echo "==> Building ${tag} (${platform})"
-  echo "    WeChat .deb will be downloaded inside Docker build"
+  echo "    WeChat substrate comes from the digest-pinned upstream base image (RB-001)"
   docker buildx build \
     ${NO_CACHE:+--no-cache} \
     --platform "$platform" \

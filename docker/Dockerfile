@@ -1,4 +1,27 @@
 # ============================================
+# WeChat Hub AgentWechat — pinned-runtime release image (RB-001 remediation)
+#
+# Reproducibility contract (enforced by scripts/ci/verify-pinned-runtime.sh):
+#   Stage 1 compiles the hardened agent-server from the exact source in this
+#   repo (Cargo.lock-pinned, multi-stage).
+#   Stage 2 starts FROM a digest-pinned upstream runtime image carrying the
+#   verified WeChat GUI substrate (WeChat 4.1.1.4 + X11/AT-SPI/noVNC stack).
+#   The WeChat .deb is NEVER downloaded at build time: the unversioned QQ
+#   download URL is forbidden in this recipe and anywhere else in the build
+#   path (enforced literally by scripts/ci/verify-pinned-runtime.sh).
+#
+# Verified working substrate (RB-001):
+#   ghcr.io/thisnick/agent-wechat:0.11.15
+#   = sha256:31a4e351c191bcbfc75e5c10be51e207d22a3eedd97f3ff56ad579fcce717b24
+#   WeChat package: wechat 4.1.1.4 (dpkg "install ok installed")
+#   /opt/wechat/wechat sha256:
+#     921391facbec202f2f1487e8a3c8e7790d037e4dc966f65901064f3ab4c4ea54
+# Do NOT change the base to a mutable tag or to `ubuntu` + .deb download.
+# A substrate bump means changing the FROM digest AND the expected
+# version/hash constants below in the same reviewed commit.
+# ============================================
+
+# ============================================
 # Stage 1: Build the Rust server binary
 # ============================================
 FROM rust:1.93-bookworm AS builder
@@ -29,108 +52,63 @@ RUN if [ "$BUILD_MODE" = "debug" ]; then cargo build; else cargo build --release
 RUN mkdir -p /output && cp target/${BUILD_MODE}/agent-server /output/agent-server
 
 # ============================================
-# Stage 2: Final runtime image
+# Stage 2: Final runtime image — digest-pinned upstream substrate
 # ============================================
-FROM ubuntu:22.04
-
-ENV DEBIAN_FRONTEND=noninteractive
+FROM ghcr.io/thisnick/agent-wechat@sha256:31a4e351c191bcbfc75e5c10be51e207d22a3eedd97f3ff56ad579fcce717b24
 
 # ============================================
-# System packages
+# RB-001 fail-closed substrate assertions.
+# The build FAILS unless the base image carries exactly the verified WeChat
+# 4.1.1.4 runtime. This is the regression guard against silent WeChat
+# runtime upgrades: any change of the base image content (rebuild of the
+# substrate with a newer WeChat, tag-based base, .deb download) breaks the
+# version check, the binary hash check, or both.
 # ============================================
-RUN apt-get update && apt-get install -y \
-    # Display
-    xvfb fluxbox x11vnc \
-    # Input automation
-    xdotool scrot \
-    # Accessibility
-    at-spi2-core gir1.2-atspi-2.0 python3 python3-gi \
-    # Notifications
-    dunst libnotify-bin \
-    # Fonts
-    fonts-noto-cjk \
-    # System
-    dbus dbus-x11 ca-certificates curl \
-    # WeChat dependencies (basic)
-    libatomic1 libasound2 libatk-bridge2.0-0 libatk1.0-0 \
-    libgbm1 libglib2.0-0 libgtk-3-0 libnss3 libx11-6 \
-    libxkbcommon0 libxkbcommon-x11-0 libxcb-icccm4 \
-    libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxss1 \
-    # Audio - needed for message notifications
-    pulseaudio alsa-base alsa-utils \
-    gstreamer1.0-pulseaudio gstreamer1.0-alsa \
-    # Media conversion (WXGF→JPEG/GIF, SILK→MP3)
-    ffmpeg \
-    # Clipboard (for paste-image tool)
-    xclip \
-    # Transparent proxy
-    redsocks iptables \
-    # SQLCipher build deps (temp, for compiling sqlcipher CLI)
-    libssl-dev build-essential tcl \
-    # Python packages for tools
-    python3-pip \
-    && rm -rf /var/lib/apt/lists/*
+RUN set -eu; \
+    BASE_WECHAT_VERSION="$(dpkg-query -W -f='${Version}' wechat)"; \
+    BASE_WECHAT_STATUS="$(dpkg-query -W -f='${Status}' wechat)"; \
+    echo "substrate wechat package: ${BASE_WECHAT_VERSION} (${BASE_WECHAT_STATUS})"; \
+    if [ "${BASE_WECHAT_VERSION}" != "4.1.1.4" ]; then \
+      echo "FATAL(RB-001): WeChat substrate version drift: expected '4.1.1.4', got '${BASE_WECHAT_VERSION}'" >&2; \
+      exit 1; \
+    fi; \
+    if [ "${BASE_WECHAT_STATUS}" != "install ok installed" ]; then \
+      echo "FATAL(RB-001): WeChat substrate package status unexpected: '${BASE_WECHAT_STATUS}'" >&2; \
+      exit 1; \
+    fi; \
+    BASE_WECHAT_SHA256="$(sha256sum /opt/wechat/wechat | awk '{print $1}')"; \
+    echo "substrate /opt/wechat/wechat sha256: ${BASE_WECHAT_SHA256}"; \
+    if [ "${BASE_WECHAT_SHA256}" != "921391facbec202f2f1487e8a3c8e7790d037e4dc966f65901064f3ab4c4ea54" ]; then \
+      echo "FATAL(RB-001): WeChat binary hash drift: expected '921391facbec202f2f1487e8a3c8e7790d037e4dc966f65901064f3ab4c4ea54', got '${BASE_WECHAT_SHA256}'" >&2; \
+      exit 1; \
+    fi
 
 # ============================================
-# Python packages
+# OCI labels for the pinned substrate (constants of this recipe).
+# Dynamic labels (revision/version/created/source-commit/upstream base
+# commit+tag) are applied by the publish workflow on top of these.
 # ============================================
-RUN pip3 install frida-tools silk-python
+LABEL org.opencontainers.image.base.name="ghcr.io/thisnick/agent-wechat@sha256:31a4e351c191bcbfc75e5c10be51e207d22a3eedd97f3ff56ad579fcce717b24" \
+      com.wechat-hub.upstream-base-image="ghcr.io/thisnick/agent-wechat:0.11.15" \
+      com.wechat-hub.upstream-base-digest="sha256:31a4e351c191bcbfc75e5c10be51e207d22a3eedd97f3ff56ad579fcce717b24" \
+      com.wechat-hub.wechat-version="4.1.1.4" \
+      com.wechat-hub.wechat-binary-sha256="921391facbec202f2f1487e8a3c8e7790d037e4dc966f65901064f3ab4c4ea54"
 
 # ============================================
-# noVNC (browser-based VNC viewer) + websockify
+# Hardened agent-server built from this exact source (Stage 1)
 # ============================================
-ARG NOVNC_VERSION=1.5.0
-RUN pip3 install websockify \
-    && curl -L https://github.com/novnc/noVNC/archive/refs/tags/v${NOVNC_VERSION}.tar.gz | tar xz -C /opt \
-    && mv /opt/noVNC-${NOVNC_VERSION} /opt/novnc
+COPY --from=builder /output/agent-server /opt/agent-server/agent-server
 
 # ============================================
-# SQLCipher 4 CLI (needed for wechat-db reads)
+# Version-controlled runtime scripts (tools + entrypoint).
+# Byte-identical to the upstream substrate today; copied so the image always
+# matches this repo even if the base image is re-assembled upstream.
 # ============================================
-RUN cd /tmp \
-    && curl -L https://github.com/sqlcipher/sqlcipher/archive/refs/tags/v4.6.1.tar.gz | tar xz \
-    && cd sqlcipher-4.6.1 \
-    && ./configure --enable-tempstore=yes CFLAGS="-DSQLITE_HAS_CODEC -DSQLCIPHER_CRYPTO_OPENSSL" LDFLAGS="-lcrypto" \
-    && make -j$(nproc) \
-    && cp sqlcipher /usr/local/bin/sqlcipher \
-    && cd / && rm -rf /tmp/sqlcipher-4.6.1
-
-# ============================================
-# X11 socket directory
-# ============================================
-RUN mkdir -p /tmp/.X11-unix && chown root:root /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
-
-# ============================================
-# WeChat
-# If docker/wechat.deb exists in the build context, it is used directly.
-# Otherwise the .deb is downloaded at build time (CI path).
-# Run `pnpm download:wechat` to cache locally for faster builds.
-# ============================================
-ARG TARGETARCH
-COPY wechat.de[b] /tmp/
-RUN if [ -f /tmp/wechat.deb ]; then \
-      echo "Installing WeChat from local .deb"; \
-    else \
-      ARCH_SUFFIX=$([ "$TARGETARCH" = "arm64" ] && echo "arm64" || echo "x86_64") \
-      && echo "Downloading WeChat for ${ARCH_SUFFIX}..." \
-      && curl -L -o /tmp/wechat.deb "https://dldir1v6.qq.com/weixin/Universal/Linux/WeChatLinux_${ARCH_SUFFIX}.deb"; \
-    fi \
-    && (dpkg -i /tmp/wechat.deb || (apt-get update && apt-get install -y -f)) \
-    && rm -rf /var/lib/apt/lists/* /tmp/wechat.deb
-
-RUN useradd -m -s /bin/bash wechat
-
-# ============================================
-# Tool scripts (screenshot, click, type, key, scroll, a11y-dump, etc.)
-# ============================================
-RUN mkdir -p /opt/tools
 COPY tools/ /opt/tools/
 RUN chmod +x /opt/tools/*
 
-# ============================================
-# Copy Rust binary from builder
-# ============================================
-COPY --from=builder /output/agent-server /opt/agent-server/agent-server
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
 # ============================================
 # Debug support (gdbserver for remote debugging)
@@ -141,24 +119,12 @@ RUN if [ "$BUILD_MODE" = "debug" ]; then \
     fi
 
 # ============================================
-# Data directory for SQLite
-# ============================================
-RUN mkdir -p /data && chown wechat:wechat /data
-VOLUME /data
-
-# ============================================
-# Environment
+# Environment (inherited from the substrate; re-declared as contract)
 # ============================================
 ENV DISPLAY=:99
 ENV PATH="/opt/tools:$PATH"
 ENV AGENT_DB_PATH=/data/agent.db
 ENV AGENT_PORT=6174
-
-# ============================================
-# Entrypoint
-# ============================================
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
 
 EXPOSE 6174 1234
 

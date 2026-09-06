@@ -9,6 +9,8 @@ reproducible publish pipeline for the WeChat Hub AgentWechat image.
 | `validate-release-tag.sh` | Whitelist-validate the release tag; anchors it to the upstream base version (e.g. base `v0.11.15` → `0.11.15-wh.<n>`); forbids mutable tags like `latest`. |
 | `ensure-tag-absent.sh` | Fail-closed GHCR tag immutability check via skopeo. Exit 0 = absent, 1 = already exists, 2 = undetermined (auth/network) — both non-zero outcomes block publishing. Override the binary with `SKOPEO_BIN` for testing. |
 | `prepare-docker-context.sh` | Assemble the docker build context from `packages/agent-server-rust` so `docker/Dockerfile` builds the binary from source. |
+| `verify-pinned-runtime.sh` | RB-001 fail-closed static contract check: `docker/Dockerfile` must FROM the digest-pinned verified upstream substrate (WeChat 4.1.1.4), must contain in-build version/binary-hash assertions, and no unversioned WeChat download input may exist in the build tree. `--print-base-digest` emits the pinned digest for workflow labels. |
+| `verify-image-substrate.sh` | RB-001 runtime verification of a built/published image: platform, labels (revision / upstream-base-digest), WeChat package version + `/opt/wechat/wechat` sha256, hardened agent-server markers — in a transient `--rm --network none` container. |
 
 ## Publishing a release (Integration agent)
 
@@ -47,6 +49,10 @@ manifest digest, and the OCI `org.opencontainers.image.revision` label.
 - `cargo fmt --check` / `cargo check --locked` / `cargo test --locked` failure → abort.
 - `upstream_base_commit` does not match the commit resolved from
   `upstream_base_tag` → abort.
+- `verify-pinned-runtime.sh` contract violation (base not digest-pinned,
+  unversioned WeChat download input, missing substrate assertions) → abort.
+- Built/published image fails `verify-image-substrate.sh` (wrong platform,
+  label mismatch, WeChat version/hash drift, hardened binary missing) → abort.
 
 ## Local testing of the scripts
 

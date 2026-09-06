@@ -5,12 +5,16 @@ on:
     paths:
       - 'packages/**'
       - 'docs/**'
+      - 'docker/**'
+      - 'scripts/**'
       - 'pnpm-lock.yaml'
       - 'package.json'
       - 'pnpm-workspace.yaml'
       - 'turbo.json'
       - 'tsconfig.json'
       - '.github/workflows/ci.yml'
+      - '.github/workflows/publish-agent-wechat.yml'
+      - '.github/workflows/docker-rebuild.yml'
 
 jobs:
   changes:
@@ -94,6 +98,26 @@ jobs:
 
       - name: Cargo test
         run: cargo test --manifest-path packages/agent-server-rust/Cargo.toml
+
+  # Static gate for the release build recipe: shell syntax + the RB-001
+  # pinned-runtime substrate contract (digest-pinned base, no unversioned
+  # WeChat download, in-build version/hash assertions). Fails closed.
+  release-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Shell syntax check (scripts/ci)
+        run: |
+          for f in scripts/ci/*.sh; do
+            bash -n "$f"
+          done
+
+      - name: Verify pinned runtime substrate contract (RB-001 fail-closed)
+        run: scripts/ci/verify-pinned-runtime.sh
 
   docs:
     needs: changes

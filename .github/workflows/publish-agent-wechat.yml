@@ -22,6 +22,11 @@
 #   - Build recipe is version-controlled: docker/Dockerfile +
 #     scripts/ci/prepare-docker-context.sh. There is no NAS-local ad-hoc
 #     Dockerfile in this pipeline.
+#   - RB-001 pinned substrate (wh.3+): docker/Dockerfile stage 2 starts FROM
+#     the digest-pinned verified upstream runtime (WeChat 4.1.1.4); WeChat is
+#     never downloaded at build time. scripts/ci/verify-pinned-runtime.sh
+#     enforces this contract preflight, and the built/published image is
+#     re-verified in a transient container (scripts/ci/verify-image-substrate.sh).
 #   - Platform: linux/amd64 only (arm64 intentionally not published; the
 #     WeChat Hub canary environment is amd64 — do not add unverified multiarch).
 #
@@ -86,6 +91,7 @@ jobs:
       image: ${{ steps.validate-tag.outputs.image }}
       upstream_base_commit: ${{ steps.verify-base.outputs.upstream_base_commit }}
       upstream_base_tag: ${{ steps.verify-base.outputs.upstream_base_tag }}
+      upstream_base_digest: ${{ steps.pinned-substrate.outputs.upstream_base_digest }}
     steps:
       # Raw inputs are only ever consumed through env vars, never interpolated
       # directly into shell commands (injection-safe pattern).
@@ -178,6 +184,13 @@ jobs:
           command -v skopeo >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y skopeo; }
           scripts/ci/ensure-tag-absent.sh "${IMAGE}:${RELEASE_TAG_INPUT}" --creds "${REGISTRY_USER}:${REGISTRY_TOKEN}"
 
+      - name: Verify pinned runtime substrate (RB-001 fail-closed)
+        id: pinned-substrate
+        run: |
+          set -euo pipefail
+          scripts/ci/verify-pinned-runtime.sh
+          echo "upstream_base_digest=$(scripts/ci/verify-pinned-runtime.sh --print-base-digest)" >> "$GITHUB_OUTPUT"
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -208,6 +221,9 @@ jobs:
       RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
       UPSTREAM_BASE_COMMIT: ${{ needs.preflight.outputs.upstream_base_commit }}
       UPSTREAM_BASE_TAG: ${{ needs.preflight.outputs.upstream_base_tag }}
+      UPSTREAM_BASE_DIGEST: ${{ needs.preflight.outputs.upstream_base_digest }}
+      WECHAT_VERSION: "4.1.1.4"
+      WECHAT_BINARY_SHA256: "921391facbec202f2f1487e8a3c8e7790d037e4dc966f65901064f3ab4c4ea54"
       REGISTRY_USER: ${{ github.actor }}
       REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -258,6 +274,9 @@ jobs:
           platforms: ${{ env.PLATFORMS }}
           # dry_run builds the full image locally but pushes nothing.
           push: ${{ !inputs.dry_run }}
+          # dry-run loads the built image into the local docker store so the
+          # substrate verification below can run against it.
+          load: ${{ inputs.dry_run }}
           # Keep the pushed manifest a plain single-platform image so the
           # reported digest matches what deployments pin.
           provenance: false
@@ -272,6 +291,7 @@ jobs:
             org.opencontainers.image.created=${{ steps.ts.outputs.created }}
             com.wechat-hub.upstream-base-commit=${{ env.UPSTREAM_BASE_COMMIT }}
             com.wechat-hub.upstream-base-tag=${{ env.UPSTREAM_BASE_TAG }}
+            com.wechat-hub.upstream-base-digest=${{ env.UPSTREAM_BASE_DIGEST }}
             com.wechat-hub.source-commit=${{ env.SOURCE_COMMIT }}
           cache-from: type=gha,scope=agent-wechat-publish-amd64
           cache-to: type=gha,scope=agent-wechat-publish-amd64,mode=max
@@ -293,6 +313,27 @@ jobs:
           fi
           echo "digest=$BUILT" >> "$GITHUB_OUTPUT"
 
+      # RB-001: prove the final image (dry-run: local build; real publish:
+      # exactly the digest the registry now serves) carries the pinned WeChat
+      # substrate and the hardened agent-server. Runs in a transient
+      # --rm --network none container; no volumes, no host ports.
+      - name: Verify pinned substrate in final image (RB-001 fail-closed)
+        env:
+          BUILT_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            IMAGE_REF="${IMAGE}:${RELEASE_TAG}"
+          else
+            IMAGE_REF="${IMAGE}@${BUILT_DIGEST}"
+            docker pull "$IMAGE_REF"
+          fi
+          EXPECTED_REVISION="$SOURCE_COMMIT" \
+          EXPECTED_BASE_DIGEST="$UPSTREAM_BASE_DIGEST" \
+          EXPECTED_WECHAT_VERSION="$WECHAT_VERSION" \
+          EXPECTED_WECHAT_BINARY_SHA256="$WECHAT_BINARY_SHA256" \
+            scripts/ci/verify-image-substrate.sh "$IMAGE_REF"
+
       - name: Write release summary
         env:
           BUILT_DIGEST: ${{ steps.build.outputs.digest }}
@@ -310,6 +351,8 @@ jobs:
             echo "| --- | --- |"
             echo "| source commit | \`${SOURCE_COMMIT}\` |"
             echo "| upstream base | \`${UPSTREAM_BASE_TAG}\` (\`${UPSTREAM_BASE_COMMIT}\`) |"
+            echo "| upstream base digest (pinned substrate) | \`${UPSTREAM_BASE_DIGEST}\` |"
+            echo "| WeChat substrate | \`${WECHAT_VERSION}\` (binary sha256 \`${WECHAT_BINARY_SHA256}\`) |"
             echo "| tag | \`${RELEASE_TAG}\` |"
             echo "| image | \`${IMAGE}\` |"
             echo "| platform | \`${PLATFORMS}\` |"

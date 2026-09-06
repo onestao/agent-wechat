@@ -12,6 +12,7 @@ docker/wechat.deb
 docker/*.partial
 docker/cache/
 docker/agent-server/
+docker/agent-server-rust/
 docker/shared/
 
 # Rust build artifacts
