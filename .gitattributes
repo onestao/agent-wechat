@@ -2,3 +2,4 @@
 scripts/ci/*.sh text eol=lf
 scripts/ci/README.md text eol=lf
 .github/workflows/*.yml text eol=lf
+packages/agent-server-rust/src/plans/test_fixtures/*.json text eol=lf
