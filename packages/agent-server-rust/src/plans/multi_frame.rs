@@ -20,6 +20,14 @@ pub enum SendPlannerError {
     ComposerNotFound,
     /// Multiple eligible composers exist with unresolved ambiguity (fail-closed).
     ComposerAmbiguous { count: usize },
+    /// No ACTIVE main WeChat frame could be established for send-safe UI work.
+    ActiveMainFrameNotFound,
+    /// More than one ACTIVE main WeChat frame exists; target surface is ambiguous.
+    ActiveMainFrameAmbiguous { count: usize },
+    /// A safe search box could not be isolated from the active main WeChat frame.
+    SearchBoxNotFound,
+    /// More than one equally eligible search box exists.
+    SearchBoxAmbiguous { count: usize },
     /// Active chat does not match intended recipient (wrong-target prevention).
     TargetNotVerified {
         expected: String,
@@ -41,20 +49,19 @@ impl std::fmt::Display for SendPlannerError {
             Self::ComposerAmbiguous { count } => {
                 write!(f, "composer_ambiguous:found_{}_candidates", count)
             }
-            Self::TargetNotVerified { expected, actual } => write!(
-                f,
-                "target_not_verified:expected='{}',actual='{}'",
-                expected,
-                actual.as_deref().unwrap_or("none")
-            ),
-            Self::SearchAmbiguous { query, candidates } => write!(
-                f,
-                "search_ambiguous:query='{}',candidates={:?}",
-                query, candidates
-            ),
-            Self::SearchTargetNotFound { query } => {
-                write!(f, "search_target_not_found:query='{}'", query)
+            Self::ActiveMainFrameNotFound => write!(f, "active_main_frame_not_found"),
+            Self::ActiveMainFrameAmbiguous { count } => {
+                write!(f, "active_main_frame_ambiguous:found_{}_frames", count)
             }
+            Self::SearchBoxNotFound => write!(f, "search_box_not_found"),
+            Self::SearchBoxAmbiguous { count } => {
+                write!(f, "search_box_ambiguous:found_{}_candidates", count)
+            }
+            Self::TargetNotVerified { .. } => write!(f, "target_not_verified"),
+            Self::SearchAmbiguous { candidates, .. } => {
+                write!(f, "search_ambiguous:found_{}_candidates", candidates.len())
+            }
+            Self::SearchTargetNotFound { .. } => write!(f, "search_target_not_found"),
         }
     }
 }
@@ -119,6 +126,26 @@ pub fn collect_top_level_frames<'a>(root: &'a A11yNode) -> Vec<FrameInfo<'a>> {
     let mut frames = Vec::new();
     find_frames_recursive(root, &mut frames);
     frames
+}
+
+/// Resolve the one and only ACTIVE main WeChat frame.
+///
+/// Send-safe automation must never fall back to an unknown or inactive frame
+/// merely because it happens to contain editable controls.
+pub fn resolve_active_main_wechat_frame<'a>(
+    root: &'a A11yNode,
+) -> Result<&'a A11yNode, SendPlannerError> {
+    let frames = collect_top_level_frames(root);
+    let active_main: Vec<&FrameInfo<'a>> = frames
+        .iter()
+        .filter(|f| f.is_active && f.is_main_wechat && !is_auxiliary_or_stale_frame(&f.name))
+        .collect();
+
+    match active_main.len() {
+        1 => Ok(active_main[0].node),
+        0 => Err(SendPlannerError::ActiveMainFrameNotFound),
+        n => Err(SendPlannerError::ActiveMainFrameAmbiguous { count: n }),
+    }
 }
 
 fn find_frames_recursive<'a>(node: &'a A11yNode, out: &mut Vec<FrameInfo<'a>>) {
@@ -219,47 +246,31 @@ pub fn resolve_active_composer<'a>(
         return Err(SendPlannerError::ComposerNotFound);
     }
 
-    // Filter 1: Prefer candidates in frames marked ACTIVE
-    let active_candidates: Vec<ComposerCandidate<'a>> = candidates
+    // Send-safe selection is intentionally strict: only candidates belonging
+    // to an ACTIVE main WeChat frame are eligible.  Unknown/inactive frames are
+    // never used as a fallback, even if they contain the only composer pair.
+    let main_frame_candidates: Vec<ComposerCandidate<'a>> = candidates
         .iter()
-        .filter(|c| c.frame_is_active)
+        .filter(|c| {
+            c.frame_is_active
+                && c.is_main_wechat_frame
+                && !is_auxiliary_or_stale_frame(&c.frame_name)
+        })
         .cloned()
         .collect();
 
-    let eligible_pool = if !active_candidates.is_empty() {
-        active_candidates
-    } else {
-        candidates
-    };
-
-    // Filter 2: Filter out known auxiliary/stale frames if any main WeChat candidate exists
-    let main_frame_candidates: Vec<ComposerCandidate<'a>> = eligible_pool
-        .iter()
-        .filter(|c| c.is_main_wechat_frame && !is_auxiliary_or_stale_frame(&c.frame_name))
-        .cloned()
-        .collect();
-
-    let candidates_after_frame_filter = if !main_frame_candidates.is_empty() {
-        main_frame_candidates
-    } else {
-        eligible_pool
-            .into_iter()
-            .filter(|c| !is_auxiliary_or_stale_frame(&c.frame_name))
-            .collect()
-    };
-
-    if candidates_after_frame_filter.is_empty() {
-        return Err(SendPlannerError::ComposerNotFound);
+    if main_frame_candidates.is_empty() {
+        return Err(SendPlannerError::ActiveMainFrameNotFound);
     }
 
     // Exactly one winner?
-    if candidates_after_frame_filter.len() == 1 {
-        let winner = &candidates_after_frame_filter[0];
+    if main_frame_candidates.len() == 1 {
+        let winner = &main_frame_candidates[0];
         return Ok((winner.edit_node, winner.send_node));
     }
 
     // Multiple candidates in eligible pool: check if one is uniquely focused or has active text
-    let focused_candidates: Vec<&ComposerCandidate<'a>> = candidates_after_frame_filter
+    let focused_candidates: Vec<&ComposerCandidate<'a>> = main_frame_candidates
         .iter()
         .filter(|c| c.edit_is_focused)
         .collect();
@@ -273,7 +284,7 @@ pub fn resolve_active_composer<'a>(
 
     // If still ambiguous between >=2 active/eligible composers, fail closed!
     Err(SendPlannerError::ComposerAmbiguous {
-        count: candidates_after_frame_filter.len(),
+        count: main_frame_candidates.len(),
     })
 }
 
@@ -283,29 +294,47 @@ pub fn resolve_active_composer<'a>(
 
 /// Extract the active chat title / header label from the chat surface.
 pub fn extract_open_chat_title(root: &A11yNode) -> Option<String> {
-    let chat_list = query_selector(root, r#"list[name="Chats"]"#);
+    let frame = resolve_active_main_wechat_frame(root).ok()?;
+    let chat_list = query_selector(frame, r#"list[name="Chats"]"#);
     let chat_list_right = chat_list
         .and_then(|c| c.bounds.as_ref())
         .map(|b| b.x + b.width)
         .unwrap_or(272.0);
 
     let mut all_labels = Vec::new();
-    collect_labels_recursive(root, &mut all_labels);
+    collect_labels_recursive(frame, &mut all_labels);
 
-    let header_label = all_labels.iter().find(|label| {
-        if let Some(b) = &label.bounds {
-            b.x >= chat_list_right
-                && b.y < 80.0
-                && !label.name.trim().is_empty()
-                && !label.name.contains("Send")
-                && !label.name.contains("WeChat")
-                && !label.name.contains("Weixin")
-        } else {
-            false
-        }
-    });
+    let header_labels: Vec<&&A11yNode> = all_labels
+        .iter()
+        .filter(|label| {
+            if let Some(b) = &label.bounds {
+                b.x >= chat_list_right
+                    && b.y < 80.0
+                    && !label.name.trim().is_empty()
+                    && !label.name.contains("Send")
+                    && !label.name.contains("WeChat")
+                    && !label.name.contains("Weixin")
+            } else {
+                false
+            }
+        })
+        .collect();
 
-    header_label.map(|l| clean_chat_title(&l.name))
+    // AT-SPI may expose the same visible header through more than one nested
+    // label node. Collapse exact normalized duplicates, but fail closed when
+    // two *different* plausible chat titles survive the filter.
+    let mut titles: Vec<String> = header_labels
+        .iter()
+        .map(|label| clean_chat_title(&label.name))
+        .filter(|title| !title.is_empty())
+        .collect();
+    titles.sort();
+    titles.dedup();
+
+    if titles.len() != 1 {
+        return None;
+    }
+    titles.into_iter().next()
 }
 
 fn collect_labels_recursive<'a>(node: &'a A11yNode, out: &mut Vec<&'a A11yNode>) {
@@ -369,6 +398,143 @@ pub fn verify_target_chat(
     }
 }
 
+/// Find a safe search box in the ACTIVE main WeChat frame.
+/// Composer edit controls are explicitly excluded. A unique named Search/搜索
+/// control wins; otherwise the unique top-most editable wins. Any unresolved
+/// tie fails closed.
+pub fn resolve_search_box<'a>(root: &'a A11yNode) -> Result<&'a A11yNode, SendPlannerError> {
+    let frame = resolve_active_main_wechat_frame(root)?;
+
+    let mut composer_candidates = Vec::new();
+    collect_composer_pairs(frame, None, &mut composer_candidates);
+    let composer_edits: Vec<*const A11yNode> = composer_candidates
+        .iter()
+        .map(|c| c.edit_node as *const A11yNode)
+        .collect();
+
+    fn collect_editables<'a>(node: &'a A11yNode, out: &mut Vec<&'a A11yNode>) {
+        if node.role == "text" && node_has_state(node, "EDITABLE") && node.bounds.is_some() {
+            out.push(node);
+        }
+        if let Some(children) = &node.children {
+            for child in children {
+                collect_editables(child, out);
+            }
+        }
+    }
+
+    let mut editables = Vec::new();
+    collect_editables(frame, &mut editables);
+    editables.retain(|n| !composer_edits.contains(&(*n as *const A11yNode)));
+
+    if editables.is_empty() {
+        return Err(SendPlannerError::SearchBoxNotFound);
+    }
+
+    let named: Vec<&A11yNode> = editables
+        .iter()
+        .copied()
+        .filter(|n| {
+            let lower = n.name.trim().to_lowercase();
+            lower == "search" || lower == "搜索" || lower.contains("search")
+        })
+        .collect();
+
+    if named.len() == 1 {
+        return Ok(named[0]);
+    }
+    if named.len() > 1 {
+        return Err(SendPlannerError::SearchBoxAmbiguous { count: named.len() });
+    }
+
+    let min_y = editables
+        .iter()
+        .filter_map(|n| n.bounds.as_ref().map(|b| b.y))
+        .fold(f64::INFINITY, f64::min);
+    let topmost: Vec<&A11yNode> = editables
+        .into_iter()
+        .filter(|n| {
+            n.bounds
+                .as_ref()
+                .map(|b| (b.y - min_y).abs() < 1.0)
+                .unwrap_or(false)
+        })
+        .collect();
+
+    match topmost.len() {
+        1 => Ok(topmost[0]),
+        0 => Err(SendPlannerError::SearchBoxNotFound),
+        n => Err(SendPlannerError::SearchBoxAmbiguous { count: n }),
+    }
+}
+
+fn collect_descendant_names(node: &A11yNode, out: &mut Vec<String>) {
+    if !node.name.trim().is_empty() {
+        out.push(node.name.trim().to_string());
+    }
+    if let Some(children) = &node.children {
+        for child in children {
+            collect_descendant_names(child, out);
+        }
+    }
+}
+
+/// Resolve a unique visible row in the ACTIVE main WeChat frame whose
+/// descendant name exactly matches the intended target name (including
+/// filehelper aliases). Zero or multiple exact matches fail closed.
+pub fn resolve_exact_target_row<'a>(
+    root: &'a A11yNode,
+    target: &str,
+) -> Result<&'a A11yNode, SendPlannerError> {
+    let frame = resolve_active_main_wechat_frame(root)?;
+
+    fn collect_rows<'a>(node: &'a A11yNode, eligible_list: bool, out: &mut Vec<&'a A11yNode>) {
+        let next_eligible = if node.role == "list" {
+            let lower = node.name.trim().to_lowercase();
+            lower == "chats"
+                || lower.contains("search")
+                || lower.contains("搜索")
+                || lower.is_empty()
+        } else {
+            eligible_list
+        };
+
+        if node.role == "list-item" && eligible_list && node.bounds.is_some() {
+            out.push(node);
+        }
+        if let Some(children) = &node.children {
+            for child in children {
+                collect_rows(child, next_eligible, out);
+            }
+        }
+    }
+
+    let mut rows = Vec::new();
+    collect_rows(frame, false, &mut rows);
+
+    let exact: Vec<&A11yNode> = rows
+        .into_iter()
+        .filter(|row| {
+            let mut names = Vec::new();
+            collect_descendant_names(row, &mut names);
+            names
+                .iter()
+                .any(|name| is_target_chat_name_match(target, name))
+        })
+        .collect();
+
+    match exact.len() {
+        1 => Ok(exact[0]),
+        0 => Err(SendPlannerError::SearchTargetNotFound {
+            query: target.to_string(),
+        }),
+        _ => Err(SendPlannerError::SearchAmbiguous {
+            query: target.to_string(),
+            candidates: exact.iter().map(|r| r.name.clone()).collect(),
+        }),
+    }
+}
+
 // ============================================================================
 // Search Matching Contracts (F8)
 // ============================================================================
@@ -376,11 +542,7 @@ pub fn verify_target_chat(
 /// Denylist check for system accounts that must never be blindly messaged.
 pub fn is_denied_system_chat(name: &str) -> bool {
     let lower = name.trim().to_lowercase();
-    lower == "file transfer"
-        || lower == "文件传输助手"
-        || lower == "微信团队"
-        || lower == "wechat team"
-        || lower == "weixin team"
+    lower == "微信团队" || lower == "wechat team" || lower == "weixin team"
 }
 
 /// Match search result candidate rows against target name (F8).
@@ -397,18 +559,26 @@ pub fn match_search_row<'a>(
         });
     }
 
-    // Filter system accounts
+    let target_is_filehelper = is_target_chat_name_match(target, "filehelper");
+
+    // Filter system accounts. File Transfer/文件传输助手 is permitted only
+    // when it is the explicitly requested filehelper target.
     let filtered_rows: Vec<&'a str> = candidate_rows
         .iter()
         .copied()
-        .filter(|row| !is_denied_system_chat(row))
+        .filter(|row| {
+            !is_denied_system_chat(row)
+                && (target_is_filehelper || !is_target_chat_name_match(row, "filehelper"))
+        })
         .collect();
 
     // Exact matches
     let exact_matches: Vec<&'a str> = filtered_rows
         .iter()
         .copied()
-        .filter(|row| row.trim().to_lowercase() == norm_target)
+        .filter(|row| {
+            row.trim().to_lowercase() == norm_target || is_target_chat_name_match(target, row)
+        })
         .collect();
 
     if exact_matches.len() == 1 {
@@ -632,12 +802,11 @@ pub mod tests {
             other => panic!("Expected SearchAmbiguous, got {:?}", other),
         }
 
-        // Blind selection of first row ("File Transfer") must be rejected
-        let system_match = match_search_row(&rows, "File Transfer");
-        assert!(
-            system_match.is_err(),
-            "System accounts like File Transfer must never be matched"
-        );
+        // File Transfer is a valid system alias only when explicitly requested
+        // as filehelper. It must not be selected for unrelated targets.
+        let filehelper_match = match_search_row(&rows, "filehelper");
+        assert_eq!(filehelper_match.unwrap(), "File Transfer");
+        assert!(match_search_row(&rows, "Some Other Person").is_err());
 
         // Exact match for "Team Project Alpha" succeeds
         let exact = match_search_row(&rows, "Team Project Alpha");
@@ -673,5 +842,219 @@ pub mod tests {
             SendPlannerError::ComposerNotFound => {}
             other => panic!("Expected ComposerNotFound, got {:?}", other),
         }
+    }
+
+    /// F11: A composer in an unknown ACTIVE frame is never a valid fallback.
+    #[test]
+    fn test_f11_unknown_active_frame_composer_fails_closed() {
+        let mut a11y = load_fixture("f1_clean_single_composer.json");
+        let app = a11y.children.as_mut().unwrap().first_mut().unwrap();
+        let frame = app.children.as_mut().unwrap().first_mut().unwrap();
+        frame.name = "Mystery Auxiliary".to_string();
+
+        let result = resolve_active_composer(&a11y);
+        assert!(matches!(
+            result,
+            Err(SendPlannerError::ActiveMainFrameNotFound)
+        ));
+    }
+
+    /// F12: Two ACTIVE main WeChat frames are ambiguous and must fail closed.
+    #[test]
+    fn test_f12_two_active_main_frames_fail_closed() {
+        let mut a11y = load_fixture("f1_clean_single_composer.json");
+        let app = a11y.children.as_mut().unwrap().first_mut().unwrap();
+        let duplicate = app.children.as_ref().unwrap().first().unwrap().clone();
+        app.children.as_mut().unwrap().push(duplicate);
+
+        let result = resolve_active_main_wechat_frame(&a11y);
+        assert!(matches!(
+            result,
+            Err(SendPlannerError::ActiveMainFrameAmbiguous { count: 2 })
+        ));
+    }
+
+    /// F13: Header verification is scoped to the ACTIVE main WeChat frame;
+    /// ghost Settings/Team labels cannot poison target identity.
+    #[test]
+    fn test_f13_ghost_header_label_is_ignored() {
+        let mut a11y = load_fixture("f4_live_multi_frame_observed.json");
+        let app = a11y.children.as_mut().unwrap().first_mut().unwrap();
+        let settings = app.children.as_mut().unwrap().get_mut(1).unwrap();
+        settings.children.as_mut().unwrap().push(A11yNode {
+            role: "label".to_string(),
+            name: "Wrong Ghost Target".to_string(),
+            bounds: Some(Bounds {
+                x: 300.0,
+                y: 20.0,
+                width: 180.0,
+                height: 30.0,
+            }),
+            children: None,
+            parent_index: None,
+            window: None,
+            states: None,
+        });
+
+        assert_eq!(extract_open_chat_title(&a11y).as_deref(), Some("testB"));
+        assert_eq!(verify_target_chat(&a11y, "testB"), Ok(true));
+    }
+
+    /// F14: Search resolution excludes the bottom composer and chooses the
+    /// explicit Search control inside the ACTIVE main WeChat frame.
+    #[test]
+    fn test_f14_search_box_beats_composer() {
+        let mut a11y = load_fixture("f4_live_multi_frame_observed.json");
+        let app = a11y.children.as_mut().unwrap().first_mut().unwrap();
+        let main = app.children.as_mut().unwrap().first_mut().unwrap();
+        main.children.as_mut().unwrap().push(A11yNode {
+            role: "text".to_string(),
+            name: "Search".to_string(),
+            bounds: Some(Bounds {
+                x: 80.0,
+                y: 20.0,
+                width: 170.0,
+                height: 32.0,
+            }),
+            children: None,
+            parent_index: None,
+            window: None,
+            states: Some(vec!["EDITABLE".to_string()]),
+        });
+
+        let search = resolve_search_box(&a11y).expect("unique Search box must resolve");
+        assert_eq!(search.name, "Search");
+        assert!(search.bounds.as_ref().unwrap().y < 100.0);
+    }
+
+    /// F15: Duplicate exact target rows are ambiguous; never click first row.
+    #[test]
+    fn test_f15_duplicate_exact_target_rows_fail_closed() {
+        let mut a11y = load_fixture("f4_live_multi_frame_observed.json");
+        let app = a11y.children.as_mut().unwrap().first_mut().unwrap();
+        let main = app.children.as_mut().unwrap().first_mut().unwrap();
+        let chats = main
+            .children
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|n| n.role == "list" && n.name == "Chats")
+            .unwrap();
+        let duplicate = chats.children.as_ref().unwrap().first().unwrap().clone();
+        chats.children.as_mut().unwrap().push(duplicate);
+
+        let result = resolve_exact_target_row(&a11y, "testB");
+        assert!(matches!(
+            result,
+            Err(SendPlannerError::SearchAmbiguous { .. })
+        ));
+    }
+
+    /// F16: File Transfer aliases are legal only for an explicit filehelper
+    /// target; WeChat Team remains denied.
+    #[test]
+    fn test_f16_filehelper_alias_is_explicitly_allowed() {
+        assert_eq!(
+            match_search_row(&["File Transfer", "Alice"], "filehelper").unwrap(),
+            "File Transfer"
+        );
+        assert_eq!(
+            match_search_row(&["文件传输助手", "Alice"], "filehelper").unwrap(),
+            "文件传输助手"
+        );
+        assert!(match_search_row(&["WeChat Team"], "WeChat Team").is_err());
+    }
+
+    /// F17: A matching label inside the Messages list is not a chat/search
+    /// target row and must never be clicked by the open-chat fallback.
+    #[test]
+    fn test_f17_message_list_item_is_not_target_row() {
+        let mut a11y = load_fixture("f4_live_multi_frame_observed.json");
+        let app = a11y.children.as_mut().unwrap().first_mut().unwrap();
+        let main = app.children.as_mut().unwrap().first_mut().unwrap();
+        main.children.as_mut().unwrap().push(A11yNode {
+            role: "list".to_string(),
+            name: "Messages".to_string(),
+            bounds: Some(Bounds {
+                x: 300.0,
+                y: 100.0,
+                width: 600.0,
+                height: 400.0,
+            }),
+            children: Some(vec![A11yNode {
+                role: "list-item".to_string(),
+                name: "GhostOnlyTarget".to_string(),
+                bounds: Some(Bounds {
+                    x: 320.0,
+                    y: 200.0,
+                    width: 500.0,
+                    height: 40.0,
+                }),
+                children: None,
+                parent_index: None,
+                window: None,
+                states: None,
+            }]),
+            parent_index: None,
+            window: None,
+            states: None,
+        });
+
+        assert!(matches!(
+            resolve_exact_target_row(&a11y, "GhostOnlyTarget"),
+            Err(SendPlannerError::SearchTargetNotFound { .. })
+        ));
+    }
+
+    /// F18: Multiple plausible header labels inside the ACTIVE main frame are
+    /// not a valid identity proof; verification must fail closed.
+    #[test]
+    fn test_f18_ambiguous_main_frame_headers_fail_closed() {
+        let mut a11y = load_fixture("f4_live_multi_frame_observed.json");
+        let app = a11y.children.as_mut().unwrap().first_mut().unwrap();
+        let main = app.children.as_mut().unwrap().first_mut().unwrap();
+        main.children.as_mut().unwrap().push(A11yNode {
+            role: "label".to_string(),
+            name: "Another Header".to_string(),
+            bounds: Some(Bounds {
+                x: 320.0,
+                y: 25.0,
+                width: 160.0,
+                height: 30.0,
+            }),
+            children: None,
+            parent_index: None,
+            window: None,
+            states: None,
+        });
+
+        assert!(extract_open_chat_title(&a11y).is_none());
+        assert_eq!(verify_target_chat(&a11y, "testB"), Ok(false));
+    }
+
+    /// F19: Duplicate AT-SPI labels that normalize to the same visible chat
+    /// title are accessibility noise, not identity ambiguity.
+    #[test]
+    fn test_f19_duplicate_same_header_title_is_deduplicated() {
+        let mut a11y = load_fixture("f4_live_multi_frame_observed.json");
+        let app = a11y.children.as_mut().unwrap().first_mut().unwrap();
+        let main = app.children.as_mut().unwrap().first_mut().unwrap();
+        main.children.as_mut().unwrap().push(A11yNode {
+            role: "label".to_string(),
+            name: "testB".to_string(),
+            bounds: Some(Bounds {
+                x: 330.0,
+                y: 26.0,
+                width: 80.0,
+                height: 18.0,
+            }),
+            children: None,
+            parent_index: None,
+            window: None,
+            states: None,
+        });
+
+        assert_eq!(extract_open_chat_title(&a11y).as_deref(), Some("testB"));
+        assert_eq!(verify_target_chat(&a11y, "testB"), Ok(true));
     }
 }
