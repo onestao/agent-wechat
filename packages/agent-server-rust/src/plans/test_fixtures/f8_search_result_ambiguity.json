@@ -1,0 +1,48 @@
+{
+  "role": "desktop-frame",
+  "name": "main",
+  "children": [
+    {
+      "role": "application",
+      "name": "wechat",
+      "children": [
+        {
+          "role": "frame",
+          "name": "WeChat",
+          "states": ["ACTIVE"],
+          "bounds": { "x": 0, "y": 0, "width": 980, "height": 710 },
+          "children": [
+            {
+              "role": "text",
+              "name": "Search",
+              "states": ["EDITABLE", "FOCUSED"],
+              "bounds": { "x": 60, "y": 20, "width": 212, "height": 30 }
+            },
+            {
+              "role": "list",
+              "name": "SearchResults",
+              "bounds": { "x": 60, "y": 60, "width": 212, "height": 650 },
+              "children": [
+                {
+                  "role": "list-item",
+                  "name": "File Transfer",
+                  "bounds": { "x": 60, "y": 60, "width": 212, "height": 50 }
+                },
+                {
+                  "role": "list-item",
+                  "name": "Team Project Alpha",
+                  "bounds": { "x": 60, "y": 110, "width": 212, "height": 50 }
+                },
+                {
+                  "role": "list-item",
+                  "name": "Team Project Beta",
+                  "bounds": { "x": 60, "y": 160, "width": 212, "height": 50 }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

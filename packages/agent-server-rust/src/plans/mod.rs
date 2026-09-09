@@ -2,6 +2,7 @@ pub mod auth_status;
 pub mod chat_open;
 pub mod login;
 pub mod logout;
+pub mod multi_frame;
 pub mod send_message;
 
 use crate::ia::types::{A11yNode, AppState, IdentifiedStates, SelectedAction};
@@ -21,6 +22,12 @@ pub trait Plan: Send + Sync {
     fn initial_plan_state(&self) -> Self::PlanState;
 
     fn is_goal_reached(&self, state: &AppState, plan_state: &Self::PlanState) -> bool;
+
+    /// Return an actionable internal failure reason if the plan cannot proceed,
+    /// avoiding generic "No action selected" diagnostics.
+    fn failure_reason(&self, _plan_state: &Self::PlanState) -> Option<String> {
+        None
+    }
 
     async fn select_action(
         &self,

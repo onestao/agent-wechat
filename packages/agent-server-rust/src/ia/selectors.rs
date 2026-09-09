@@ -27,6 +27,12 @@ pub fn find_ancestor_by_role<'a>(
     None
 }
 
+/// Match send button names across English and Chinese locales ("Send(S)", "发送(S)", "Send", "发送").
+pub fn is_send_button_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    trimmed.to_ascii_lowercase().contains("send") || trimmed.contains("发送")
+}
+
 // ============================================
 // Selector AST Types
 // ============================================
@@ -559,5 +565,16 @@ mod tests {
         let tree = node("root", "", Some(vec![node("item", "Hello\nWorld", None)]));
         let results = query_selector_all(&tree, r#"item[name=/hello.*world/is]"#);
         assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_is_send_button_name() {
+        assert!(is_send_button_name("Send(S)"));
+        assert!(is_send_button_name("发送(S)"));
+        assert!(is_send_button_name("Send"));
+        assert!(is_send_button_name("发送"));
+        assert!(is_send_button_name("  Send(S)  "));
+        assert!(!is_send_button_name("Cancel"));
+        assert!(!is_send_button_name("Close"));
     }
 }

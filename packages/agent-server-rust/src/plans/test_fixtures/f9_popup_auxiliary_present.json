@@ -1,0 +1,69 @@
+{
+  "role": "desktop-frame",
+  "name": "main",
+  "children": [
+    {
+      "role": "application",
+      "name": "wechat",
+      "children": [
+        {
+          "role": "frame",
+          "name": "WeChat",
+          "states": ["ACTIVE"],
+          "bounds": { "x": 0, "y": 0, "width": 980, "height": 710 },
+          "children": [
+            {
+              "role": "list",
+              "name": "Chats",
+              "bounds": { "x": 60, "y": 0, "width": 212, "height": 710 },
+              "children": [
+                {
+                  "role": "list-item",
+                  "name": "testB",
+                  "states": ["SELECTED"],
+                  "bounds": { "x": 60, "y": 0, "width": 212, "height": 60 }
+                }
+              ]
+            },
+            {
+              "role": "panel",
+              "name": "ChatArea",
+              "bounds": { "x": 272, "y": 0, "width": 708, "height": 710 },
+              "children": [
+                {
+                  "role": "label",
+                  "name": "testB",
+                  "bounds": { "x": 300, "y": 20, "width": 200, "height": 30 }
+                },
+                {
+                  "role": "panel",
+                  "name": "ComposerArea",
+                  "bounds": { "x": 272, "y": 500, "width": 708, "height": 210 },
+                  "children": [
+                    {
+                      "role": "text",
+                      "name": "",
+                      "states": ["EDITABLE"],
+                      "bounds": { "x": 280, "y": 550, "width": 680, "height": 100 }
+                    },
+                    {
+                      "role": "push-button",
+                      "name": "Send(S)",
+                      "states": ["ENABLED"],
+                      "bounds": { "x": 880, "y": 660, "width": 80, "height": 30 }
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "role": "tooltip",
+          "name": "Sync completed",
+          "bounds": { "x": 800, "y": 30, "width": 150, "height": 40 }
+        }
+      ]
+    }
+  ]
+}

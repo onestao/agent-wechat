@@ -1,0 +1,66 @@
+{
+  "role": "desktop-frame",
+  "name": "main",
+  "children": [
+    {
+      "role": "application",
+      "name": "wechat",
+      "children": [
+        {
+          "role": "frame",
+          "name": "WeChat",
+          "states": ["ACTIVE"],
+          "bounds": { "x": 0, "y": 0, "width": 980, "height": 710 },
+          "children": [
+            {
+              "role": "panel",
+              "name": "ChatArea1",
+              "bounds": { "x": 272, "y": 0, "width": 708, "height": 710 },
+              "children": [
+                {
+                  "role": "text",
+                  "name": "",
+                  "states": ["EDITABLE"],
+                  "bounds": { "x": 280, "y": 550, "width": 680, "height": 100 }
+                },
+                {
+                  "role": "push-button",
+                  "name": "Send(S)",
+                  "states": ["ENABLED"],
+                  "bounds": { "x": 880, "y": 660, "width": 80, "height": 30 }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "role": "frame",
+          "name": "WeChat - Detached Chat",
+          "states": ["ACTIVE"],
+          "bounds": { "x": 100, "y": 100, "width": 800, "height": 600 },
+          "children": [
+            {
+              "role": "panel",
+              "name": "ChatArea2",
+              "bounds": { "x": 100, "y": 100, "width": 800, "height": 600 },
+              "children": [
+                {
+                  "role": "text",
+                  "name": "",
+                  "states": ["EDITABLE"],
+                  "bounds": { "x": 120, "y": 450, "width": 760, "height": 100 }
+                },
+                {
+                  "role": "push-button",
+                  "name": "Send(S)",
+                  "states": ["ENABLED"],
+                  "bounds": { "x": 800, "y": 560, "width": 80, "height": 30 }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

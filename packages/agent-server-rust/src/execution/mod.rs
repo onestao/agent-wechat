@@ -269,10 +269,14 @@ where
 
         // No action = stuck (only if plan returns None)
         if selected.is_none() {
+            let error_msg = plan
+                .failure_reason(&plan_state)
+                .unwrap_or_else(|| "No action selected".to_string());
+            tracing::warn!("[exec] No action selected, reason: {}", error_msg);
             return (
                 ExecutionResult {
                     success: false,
-                    error: Some("No action selected".to_string()),
+                    error: Some(error_msg),
                 },
                 plan_state,
             );
