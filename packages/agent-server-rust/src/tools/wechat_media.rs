@@ -1050,7 +1050,10 @@ mod tests {
 
         assert_eq!(res.media_type, "sticker");
         assert_eq!(res.data, None);
-        assert_eq!(res.url, Some("https://res.wx.qq.com/emoji/test_123.gif".to_string()));
+        assert_eq!(
+            res.url,
+            Some("https://res.wx.qq.com/emoji/test_123.gif".to_string())
+        );
         assert_eq!(res.format, "gif");
         assert_eq!(res.filename, "emoji_deadbeef9988.gif");
         assert_eq!(res.role, Some("original".to_string()));
@@ -1065,7 +1068,10 @@ mod tests {
 
         assert_eq!(res.media_type, "sticker");
         assert_eq!(res.data, None);
-        assert_eq!(res.url, Some("https://res.wx.qq.com/emoji/enc_456.gif".to_string()));
+        assert_eq!(
+            res.url,
+            Some("https://res.wx.qq.com/emoji/enc_456.gif".to_string())
+        );
         assert_eq!(res.format, "gif");
         assert_eq!(res.filename, "emoji_feedface0011.gif");
         assert_eq!(res.role, Some("original".to_string()));

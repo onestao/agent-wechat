@@ -435,14 +435,30 @@ pub(crate) fn classify_message(
                 0
             };
             if reply.is_some() {
-                (Some("reply".to_string()), if appmsg_type > 0 { Some(appmsg_type) } else { Some(57) }, None)
+                (
+                    Some("reply".to_string()),
+                    if appmsg_type > 0 {
+                        Some(appmsg_type)
+                    } else {
+                        Some(57)
+                    },
+                    None,
+                )
             } else if appmsg_type == 6 {
                 let fname = extract_xml_tag(body, "title");
                 (Some("file".to_string()), Some(6), fname)
             } else if appmsg_type == 5 || appmsg_type == 3 || appmsg_type == 4 {
                 (Some("link".to_string()), Some(appmsg_type), None)
             } else {
-                (Some("unknown".to_string()), if appmsg_type > 0 { Some(appmsg_type) } else { None }, None)
+                (
+                    Some("unknown".to_string()),
+                    if appmsg_type > 0 {
+                        Some(appmsg_type)
+                    } else {
+                        None
+                    },
+                    None,
+                )
             }
         }
         _ => (Some("unknown".to_string()), None, None),
@@ -477,7 +493,8 @@ mod tests {
 
     #[test]
     fn test_type47_sticker() {
-        let xml = r#"<msg><emoji cdnurl="https://res.wx.qq.com/emoji/test.gif" md5="a1b2c3d4" /></msg>"#;
+        let xml =
+            r#"<msg><emoji cdnurl="https://res.wx.qq.com/emoji/test.gif" md5="a1b2c3d4" /></msg>"#;
         let cleaned = clean_content(xml, 47);
         assert_eq!(cleaned, "https://res.wx.qq.com/emoji/test.gif");
         let (kind, subtype, filename) = classify_message(xml, 47, &None);

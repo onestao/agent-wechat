@@ -100,7 +100,10 @@ pub async fn get_media(
         None => {
             return if params.raw {
                 let mut resp = (axum::http::StatusCode::NOT_FOUND, "unsupported").into_response();
-                resp.headers_mut().insert("x-media-status", axum::http::HeaderValue::from_static("unsupported"));
+                resp.headers_mut().insert(
+                    "x-media-status",
+                    axum::http::HeaderValue::from_static("unsupported"),
+                );
                 resp
             } else {
                 Json(MediaResult {
@@ -111,7 +114,8 @@ pub async fn get_media(
                     filename: String::new(),
                     role: None,
                     file_path: None,
-                }).into_response()
+                })
+                .into_response()
             };
         }
     };
@@ -120,7 +124,10 @@ pub async fn get_media(
         None => {
             return if params.raw {
                 let mut resp = (axum::http::StatusCode::NOT_FOUND, "unsupported").into_response();
-                resp.headers_mut().insert("x-media-status", axum::http::HeaderValue::from_static("unsupported"));
+                resp.headers_mut().insert(
+                    "x-media-status",
+                    axum::http::HeaderValue::from_static("unsupported"),
+                );
                 resp
             } else {
                 Json(MediaResult {
@@ -131,7 +138,8 @@ pub async fn get_media(
                     filename: String::new(),
                     role: None,
                     file_path: None,
-                }).into_response()
+                })
+                .into_response()
             };
         }
     };
@@ -142,26 +150,32 @@ pub async fn get_media(
     };
 
     // 1. Determine message type FIRST from message DB.
-    let (local_type, _create_time, _content) = match lookup_message_raw(&logged_in_user, &keys, &chat_id, local_id) {
-        Some(t) => t,
-        None => {
-            return if params.raw {
-                let mut resp = (axum::http::StatusCode::NOT_FOUND, "unsupported").into_response();
-                resp.headers_mut().insert("x-media-status", axum::http::HeaderValue::from_static("unsupported"));
-                resp
-            } else {
-                Json(MediaResult {
-                    media_type: "unsupported".to_string(),
-                    data: None,
-                    url: None,
-                    format: String::new(),
-                    filename: String::new(),
-                    role: None,
-                    file_path: None,
-                }).into_response()
-            };
-        }
-    };
+    let (local_type, _create_time, _content) =
+        match lookup_message_raw(&logged_in_user, &keys, &chat_id, local_id) {
+            Some(t) => t,
+            None => {
+                return if params.raw {
+                    let mut resp =
+                        (axum::http::StatusCode::NOT_FOUND, "unsupported").into_response();
+                    resp.headers_mut().insert(
+                        "x-media-status",
+                        axum::http::HeaderValue::from_static("unsupported"),
+                    );
+                    resp
+                } else {
+                    Json(MediaResult {
+                        media_type: "unsupported".to_string(),
+                        data: None,
+                        url: None,
+                        format: String::new(),
+                        filename: String::new(),
+                        role: None,
+                        file_path: None,
+                    })
+                    .into_response()
+                };
+            }
+        };
 
     let base_type = (local_type & 0xFFFFFFFF) as i32;
 
@@ -197,10 +211,15 @@ pub async fn get_media(
         reload_keys,
         save_keys,
         extract_fn,
-    ).await {
+    )
+    .await
+    {
         return if params.raw {
             let mut resp = (axum::http::StatusCode::ACCEPTED, "pending").into_response();
-            resp.headers_mut().insert("x-media-status", axum::http::HeaderValue::from_static("pending"));
+            resp.headers_mut().insert(
+                "x-media-status",
+                axum::http::HeaderValue::from_static("pending"),
+            );
             resp
         } else {
             Json(MediaResult {
@@ -211,7 +230,8 @@ pub async fn get_media(
                 filename: String::new(),
                 role: None,
                 file_path: None,
-            }).into_response()
+            })
+            .into_response()
         };
     }
 
@@ -220,13 +240,7 @@ pub async fn get_media(
         get_image_keys(&db, &session.id, &logged_in_user)
     };
 
-    let media = get_message_media(
-        &logged_in_user,
-        &keys,
-        &chat_id,
-        local_id,
-        image_keys,
-    );
+    let media = get_message_media(&logged_in_user, &keys, &chat_id, local_id, image_keys);
 
     if !params.raw {
         return Json(media).into_response();
@@ -234,13 +248,19 @@ pub async fn get_media(
 
     if media.media_type == "unsupported" {
         let mut resp = (axum::http::StatusCode::NOT_FOUND, "unsupported").into_response();
-        resp.headers_mut().insert("x-media-status", axum::http::HeaderValue::from_static("unsupported"));
+        resp.headers_mut().insert(
+            "x-media-status",
+            axum::http::HeaderValue::from_static("unsupported"),
+        );
         return resp;
     }
 
     if media.media_type == "pending" {
         let mut resp = (axum::http::StatusCode::ACCEPTED, "pending").into_response();
-        resp.headers_mut().insert("x-media-status", axum::http::HeaderValue::from_static("pending"));
+        resp.headers_mut().insert(
+            "x-media-status",
+            axum::http::HeaderValue::from_static("pending"),
+        );
         return resp;
     }
 
@@ -251,7 +271,10 @@ pub async fn get_media(
         if let Ok(val) = axum::http::HeaderValue::from_str(url) {
             headers.insert("x-media-url", val);
         }
-        headers.insert("x-media-status", axum::http::HeaderValue::from_static("ready"));
+        headers.insert(
+            "x-media-status",
+            axum::http::HeaderValue::from_static("ready"),
+        );
         let role_str = media.role.as_deref().unwrap_or("original");
         if let Ok(val) = axum::http::HeaderValue::from_str(role_str) {
             headers.insert("x-media-role", val);
@@ -281,7 +304,9 @@ pub async fn get_media(
             let headers = resp.headers_mut();
             headers.insert(
                 axum::http::header::CONTENT_TYPE,
-                axum::http::HeaderValue::from_str(mime).unwrap_or(axum::http::HeaderValue::from_static("application/octet-stream")),
+                axum::http::HeaderValue::from_str(mime).unwrap_or(
+                    axum::http::HeaderValue::from_static("application/octet-stream"),
+                ),
             );
             if let Ok(metadata) = path.metadata() {
                 headers.insert(
@@ -293,7 +318,10 @@ pub async fn get_media(
             if let Ok(val) = axum::http::HeaderValue::from_str(&disp) {
                 headers.insert(axum::http::header::CONTENT_DISPOSITION, val);
             }
-            headers.insert("x-media-status", axum::http::HeaderValue::from_static("ready"));
+            headers.insert(
+                "x-media-status",
+                axum::http::HeaderValue::from_static("ready"),
+            );
             let role_str = media.role.as_deref().unwrap_or("original");
             if let Ok(val) = axum::http::HeaderValue::from_str(role_str) {
                 headers.insert("x-media-role", val);
@@ -307,7 +335,8 @@ pub async fn get_media(
 
     // 3. In-memory base64 data:
     if let Some(b64) = media.data {
-        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &b64).unwrap_or_default();
+        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &b64)
+            .unwrap_or_default();
         let mime = match media.format.to_lowercase().as_str() {
             "jpg" | "jpeg" => "image/jpeg",
             "png" => "image/png",
@@ -321,13 +350,18 @@ pub async fn get_media(
         let headers = resp.headers_mut();
         headers.insert(
             axum::http::header::CONTENT_TYPE,
-            axum::http::HeaderValue::from_str(mime).unwrap_or(axum::http::HeaderValue::from_static("application/octet-stream")),
+            axum::http::HeaderValue::from_str(mime).unwrap_or(
+                axum::http::HeaderValue::from_static("application/octet-stream"),
+            ),
         );
         let disp = format!("inline; filename=\"{}\"", media.filename);
         if let Ok(val) = axum::http::HeaderValue::from_str(&disp) {
             headers.insert(axum::http::header::CONTENT_DISPOSITION, val);
         }
-        headers.insert("x-media-status", axum::http::HeaderValue::from_static("ready"));
+        headers.insert(
+            "x-media-status",
+            axum::http::HeaderValue::from_static("ready"),
+        );
         let role_str = media.role.as_deref().unwrap_or("original");
         if let Ok(val) = axum::http::HeaderValue::from_str(role_str) {
             headers.insert("x-media-role", val);
@@ -339,7 +373,10 @@ pub async fn get_media(
     }
 
     let mut resp = (axum::http::StatusCode::ACCEPTED, "pending").into_response();
-    resp.headers_mut().insert("x-media-status", axum::http::HeaderValue::from_static("pending"));
+    resp.headers_mut().insert(
+        "x-media-status",
+        axum::http::HeaderValue::from_static("pending"),
+    );
     resp
 }
 
@@ -533,7 +570,12 @@ where
         return Ok(false);
     }
 
-    let _guard = match tokio::time::timeout(std::time::Duration::from_secs(5), VOICE_KEY_EXTRACTION_MUTEX.lock()).await {
+    let _guard = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        VOICE_KEY_EXTRACTION_MUTEX.lock(),
+    )
+    .await
+    {
         Ok(g) => g,
         Err(_) => {
             tracing::warn!("[media] voice key extraction lock timed out after 5s");
@@ -589,10 +631,15 @@ mod tests {
                 c.fetch_add(1, Ordering::SeqCst);
                 std::collections::HashMap::new()
             },
-        ).await;
+        )
+        .await;
 
         assert_eq!(res, Ok(false));
-        assert_eq!(counter.load(Ordering::SeqCst), 0, "image with missing unrelated media key must not trigger extraction");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "image with missing unrelated media key must not trigger extraction"
+        );
     }
 
     #[tokio::test]
@@ -613,10 +660,15 @@ mod tests {
                 c.fetch_add(1, Ordering::SeqCst);
                 std::collections::HashMap::new()
             },
-        ).await;
+        )
+        .await;
 
         assert_eq!(res, Ok(false));
-        assert_eq!(counter.load(Ordering::SeqCst), 0, "sticker with missing unrelated media key must not trigger extraction");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "sticker with missing unrelated media key must not trigger extraction"
+        );
     }
 
     #[tokio::test]
@@ -637,10 +689,15 @@ mod tests {
                 c.fetch_add(1, Ordering::SeqCst);
                 std::collections::HashMap::new()
             },
-        ).await;
+        )
+        .await;
 
         assert_eq!(res, Ok(false));
-        assert_eq!(counter.load(Ordering::SeqCst), 0, "video must not trigger extraction");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "video must not trigger extraction"
+        );
     }
 
     #[tokio::test]
@@ -661,10 +718,15 @@ mod tests {
                 c.fetch_add(1, Ordering::SeqCst);
                 std::collections::HashMap::new()
             },
-        ).await;
+        )
+        .await;
 
         assert_eq!(res, Ok(false));
-        assert_eq!(counter.load(Ordering::SeqCst), 0, "file must not trigger extraction");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "file must not trigger extraction"
+        );
     }
 
     #[tokio::test]
@@ -687,10 +749,15 @@ mod tests {
                 map.insert("media_0.db".to_string(), "key0".to_string());
                 map
             },
-        ).await;
+        )
+        .await;
 
         assert_eq!(res, Ok(true));
-        assert_eq!(counter.load(Ordering::SeqCst), 1, "voice missing media key must extract exactly once");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "voice missing media key must extract exactly once"
+        );
     }
 
     #[tokio::test]
@@ -729,7 +796,8 @@ mod tests {
                         map.insert("media_0.db".to_string(), "key0".to_string());
                         map
                     },
-                ).await
+                )
+                .await
             }));
         }
 
@@ -738,6 +806,10 @@ mod tests {
             assert!(res.is_ok());
         }
 
-        assert_eq!(counter.load(Ordering::SeqCst), 1, "concurrent voice requests must extract exactly once");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "concurrent voice requests must extract exactly once"
+        );
     }
 }
