@@ -24,6 +24,8 @@ fn unsupported() -> MediaResult {
         url: None,
         format: String::new(),
         filename: String::new(),
+        role: None,
+        file_path: None,
     }
 }
 
@@ -34,6 +36,8 @@ fn pending() -> MediaResult {
         url: None,
         format: String::new(),
         filename: String::new(),
+        role: None,
+        file_path: None,
     }
 }
 
@@ -131,6 +135,7 @@ fn get_image_thumbnail(
             .join("Thumb")
             .join(&thumb_name);
         if thumb_path.exists() {
+            let p_str = thumb_path.to_string_lossy().to_string();
             if let Ok(data) = fs::read(&thumb_path) {
                 return Some(MediaResult {
                     media_type: "image".into(),
@@ -141,6 +146,8 @@ fn get_image_thumbnail(
                     url: None,
                     format: "jpeg".into(),
                     filename: format!("msg_{local_id}.jpg"),
+                    role: Some("thumbnail".into()),
+                    file_path: Some(p_str),
                 });
             }
         }
@@ -157,6 +164,7 @@ fn get_image_thumbnail(
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
                 if name.starts_with(&prefix) {
+                    let p_str = entry.path().to_string_lossy().to_string();
                     if let Ok(data) = fs::read(entry.path()) {
                         return Some(MediaResult {
                             media_type: "image".into(),
@@ -167,6 +175,8 @@ fn get_image_thumbnail(
                             url: None,
                             format: "jpeg".into(),
                             filename: format!("msg_{local_id}.jpg"),
+                            role: Some("thumbnail".into()),
+                            file_path: Some(p_str),
                         });
                     }
                 }
@@ -540,59 +550,46 @@ fn get_video_data(
             // Try .mp4 first (full video)
             let mp4_path = video_dir.join(format!("{hash}.mp4"));
             if mp4_path.exists() {
-                if let Ok(data) = fs::read(&mp4_path) {
-                    tracing::info!(
-                        "[media:video] found mp4 for local_id={}, size={}",
-                        local_id,
-                        data.len()
-                    );
-                    return MediaResult {
-                        media_type: "video".into(),
-                        data: Some(base64::Engine::encode(
-                            &base64::engine::general_purpose::STANDARD,
-                            &data,
-                        )),
-                        url: None,
-                        format: "mp4".into(),
-                        filename: format!("msg_{local_id}.mp4"),
-                    };
-                }
+                let p_str = mp4_path.to_string_lossy().to_string();
+                return MediaResult {
+                    media_type: "video".into(),
+                    data: None,
+                    url: None,
+                    format: "mp4".into(),
+                    filename: format!("msg_{local_id}.mp4"),
+                    role: Some("original".into()),
+                    file_path: Some(p_str),
+                };
             }
 
             // Try cover .jpg (full-size cover image)
             let cover_path = video_dir.join(format!("{hash}.jpg"));
             if cover_path.exists() {
-                if let Ok(data) = fs::read(&cover_path) {
-                    tracing::info!("[media:video] found cover for local_id={}", local_id);
-                    return MediaResult {
-                        media_type: "video".into(),
-                        data: Some(base64::Engine::encode(
-                            &base64::engine::general_purpose::STANDARD,
-                            &data,
-                        )),
-                        url: None,
-                        format: "jpeg".into(),
-                        filename: format!("msg_{local_id}_cover.jpg"),
-                    };
-                }
+                let p_str = cover_path.to_string_lossy().to_string();
+                return MediaResult {
+                    media_type: "video".into(),
+                    data: None,
+                    url: None,
+                    format: "jpeg".into(),
+                    filename: format!("msg_{local_id}_cover.jpg"),
+                    role: Some("thumbnail".into()),
+                    file_path: Some(p_str),
+                };
             }
 
             // Try _thumb.jpg
             let thumb_path = video_dir.join(format!("{hash}_thumb.jpg"));
             if thumb_path.exists() {
-                if let Ok(data) = fs::read(&thumb_path) {
-                    tracing::info!("[media:video] found thumb for local_id={}", local_id);
-                    return MediaResult {
-                        media_type: "video".into(),
-                        data: Some(base64::Engine::encode(
-                            &base64::engine::general_purpose::STANDARD,
-                            &data,
-                        )),
-                        url: None,
-                        format: "jpeg".into(),
-                        filename: format!("msg_{local_id}_thumb.jpg"),
-                    };
-                }
+                let p_str = thumb_path.to_string_lossy().to_string();
+                return MediaResult {
+                    media_type: "video".into(),
+                    data: None,
+                    url: None,
+                    format: "jpeg".into(),
+                    filename: format!("msg_{local_id}_thumb.jpg"),
+                    role: Some("thumbnail".into()),
+                    file_path: Some(p_str),
+                };
             }
         }
     }
@@ -642,6 +639,8 @@ fn decrypt_and_return(dat_path: &str, image_keys: &ImageKeys, local_id: i64) -> 
                 url: None,
                 format: "jpeg".into(),
                 filename: format!("msg_{local_id}.jpg"),
+                role: None,
+                file_path: None,
             }
         }
     };
@@ -655,6 +654,8 @@ fn decrypt_and_return(dat_path: &str, image_keys: &ImageKeys, local_id: i64) -> 
                 url: None,
                 format: "jpeg".into(),
                 filename: format!("msg_{local_id}.jpg"),
+                role: None,
+                file_path: None,
             }
         }
     };
@@ -668,6 +669,8 @@ fn decrypt_and_return(dat_path: &str, image_keys: &ImageKeys, local_id: i64) -> 
                 url: None,
                 format: "jpeg".into(),
                 filename: format!("msg_{local_id}.jpg"),
+                role: None,
+                file_path: None,
             }
         }
     };
@@ -691,6 +694,8 @@ fn decrypt_and_return(dat_path: &str, image_keys: &ImageKeys, local_id: i64) -> 
                 url: None,
                 format: cfmt,
                 filename: format!("msg_{local_id}.{cext}"),
+                role: Some("original".into()),
+                file_path: None,
             };
         }
         // Try _t.dat thumbnail
@@ -709,6 +714,8 @@ fn decrypt_and_return(dat_path: &str, image_keys: &ImageKeys, local_id: i64) -> 
                             url: None,
                             format: tf.into(),
                             filename: format!("msg_{local_id}.{te}"),
+                            role: Some("thumbnail".into()),
+                            file_path: None,
                         };
                     }
                 }
@@ -725,10 +732,12 @@ fn decrypt_and_return(dat_path: &str, image_keys: &ImageKeys, local_id: i64) -> 
         url: None,
         format: format.into(),
         filename: format!("msg_{local_id}.{ext}"),
+        role: Some("original".into()),
+        file_path: None,
     }
 }
 
-// ── Emoji ────────────────────────────────────────────────────────────────────
+// ── Emoji / Sticker ──────────────────────────────────────────────────────────
 
 fn get_emoji_media(
     account_dir: &str,
@@ -753,36 +762,42 @@ fn get_emoji_media(
             if let Some(url) = row.get("cdn_url").and_then(|v| v.as_str()) {
                 if !url.is_empty() {
                     return MediaResult {
-                        media_type: "emoji".into(),
+                        media_type: "sticker".into(),
                         data: None,
                         url: Some(url.to_string()),
                         format: "gif".into(),
                         filename: format!("emoji_{md5_val}.gif"),
+                        role: Some("original".into()),
+                        file_path: None,
                     };
                 }
             }
         }
     }
 
-    // Fallback: extract cdnurl from message XML
-    if let Some(url) = xml_attr(content, "cdnurl") {
+    // Fallback: extract cdnurl or encrypturl from message XML
+    if let Some(url) = xml_attr(content, "cdnurl").or_else(|| xml_attr(content, "encrypturl")) {
         if url.starts_with("http") {
             return MediaResult {
-                media_type: "emoji".into(),
+                media_type: "sticker".into(),
                 data: None,
                 url: Some(url),
                 format: "gif".into(),
                 filename: format!("emoji_{md5_val}.gif"),
+                role: Some("original".into()),
+                file_path: None,
             };
         }
     }
 
     MediaResult {
-        media_type: "emoji".into(),
+        media_type: "sticker".into(),
         data: None,
         url: None,
         format: "unknown".into(),
         filename: format!("emoji_{md5_val}"),
+        role: None,
+        file_path: None,
     }
 }
 
@@ -848,6 +863,8 @@ fn get_voice_data(
                 url: None,
                 format: "mp3".into(),
                 filename: format!("msg_{local_id}.mp3"),
+                role: Some("original".into()),
+                file_path: None,
             };
         }
 
@@ -861,6 +878,8 @@ fn get_voice_data(
             url: None,
             format: "silk".into(),
             filename: format!("msg_{local_id}.silk"),
+            role: Some("original".into()),
+            file_path: None,
         };
     }
 
@@ -890,18 +909,16 @@ fn get_file_attachment(
             .join(&year_month)
             .join(&filename);
         if file_path.exists() {
-            if let Ok(data) = fs::read(&file_path) {
-                return MediaResult {
-                    media_type: "file".into(),
-                    data: Some(base64::Engine::encode(
-                        &base64::engine::general_purpose::STANDARD,
-                        &data,
-                    )),
-                    url: None,
-                    format: ext,
-                    filename,
-                };
-            }
+            let p_str = file_path.to_string_lossy().to_string();
+            return MediaResult {
+                media_type: "file".into(),
+                data: None,
+                url: None,
+                format: ext,
+                filename,
+                role: Some("original".into()),
+                file_path: Some(p_str),
+            };
         }
     }
 
@@ -995,6 +1012,8 @@ pub fn get_message_media(
                 url: None,
                 format: "jpeg".into(),
                 filename: format!("msg_{local_id}.jpg"),
+                role: None,
+                file_path: None,
             }
         }
         43 => {
@@ -1006,8 +1025,8 @@ pub fn get_message_media(
             get_voice_data(account_dir, keys, chat_id, local_id)
         }
         47 => {
-            // Emoji — CDN URL is included in message content, not a downloadable media
-            unsupported()
+            // Emoji / Sticker
+            get_emoji_media(account_dir, keys, &content, local_id)
         }
         _ => {
             // Other types: check for cached thumbnail
@@ -1016,5 +1035,65 @@ pub fn get_message_media(
             }
             unsupported()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_url_backed_sticker_resolution() {
+        let keys = HashMap::new();
+        let content = r#"<msg><emoji cdnurl="https://res.wx.qq.com/emoji/test_123.gif" md5="deadbeef9988" /></msg>"#;
+        let res = get_emoji_media("dummy_account", &keys, content, 100);
+
+        assert_eq!(res.media_type, "sticker");
+        assert_eq!(res.data, None);
+        assert_eq!(res.url, Some("https://res.wx.qq.com/emoji/test_123.gif".to_string()));
+        assert_eq!(res.format, "gif");
+        assert_eq!(res.filename, "emoji_deadbeef9988.gif");
+        assert_eq!(res.role, Some("original".to_string()));
+        assert_eq!(res.file_path, None);
+    }
+
+    #[test]
+    fn test_url_backed_sticker_encrypturl_fallback() {
+        let keys = HashMap::new();
+        let content = r#"<msg><emoji encrypturl="https://res.wx.qq.com/emoji/enc_456.gif" md5="feedface0011" /></msg>"#;
+        let res = get_emoji_media("dummy_account", &keys, content, 101);
+
+        assert_eq!(res.media_type, "sticker");
+        assert_eq!(res.data, None);
+        assert_eq!(res.url, Some("https://res.wx.qq.com/emoji/enc_456.gif".to_string()));
+        assert_eq!(res.format, "gif");
+        assert_eq!(res.filename, "emoji_feedface0011.gif");
+        assert_eq!(res.role, Some("original".to_string()));
+    }
+
+    #[test]
+    fn test_media_roles_thumbnail_and_original() {
+        // Test role preservation contracts
+        let thumb_res = MediaResult {
+            media_type: "image".into(),
+            data: Some("base64thumb".into()),
+            url: None,
+            format: "jpeg".into(),
+            filename: "msg_123_thumb.jpg".into(),
+            role: Some("thumbnail".into()),
+            file_path: None,
+        };
+        assert_eq!(thumb_res.role, Some("thumbnail".to_string()));
+
+        let orig_res = MediaResult {
+            media_type: "image".into(),
+            data: Some("base64orig".into()),
+            url: None,
+            format: "jpeg".into(),
+            filename: "msg_123.jpg".into(),
+            role: Some("original".into()),
+            file_path: None,
+        };
+        assert_eq!(orig_res.role, Some("original".to_string()));
     }
 }

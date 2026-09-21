@@ -1,5 +1,6 @@
 use axum::{
     extract::{Path, Query},
+    response::IntoResponse,
     Json,
 };
 use serde::Deserialize;
@@ -84,29 +85,54 @@ pub async fn list_messages(
     ))
 }
 
-pub async fn get_media(Path((chat_id, local_id)): Path<(String, i64)>) -> Json<MediaResult> {
+#[derive(Deserialize, Default)]
+pub struct MediaParams {
+    #[serde(default)]
+    pub raw: bool,
+}
+
+pub async fn get_media(
+    Path((chat_id, local_id)): Path<(String, i64)>,
+    Query(params): Query<MediaParams>,
+) -> axum::response::Response {
     let session = match get_session("default") {
         Some(s) => s,
         None => {
-            return Json(MediaResult {
-                media_type: "unsupported".to_string(),
-                data: None,
-                url: None,
-                format: String::new(),
-                filename: String::new(),
-            })
+            return if params.raw {
+                let mut resp = (axum::http::StatusCode::NOT_FOUND, "unsupported").into_response();
+                resp.headers_mut().insert("x-media-status", axum::http::HeaderValue::from_static("unsupported"));
+                resp
+            } else {
+                Json(MediaResult {
+                    media_type: "unsupported".to_string(),
+                    data: None,
+                    url: None,
+                    format: String::new(),
+                    filename: String::new(),
+                    role: None,
+                    file_path: None,
+                }).into_response()
+            };
         }
     };
     let logged_in_user = match &session.logged_in_user {
         Some(u) => u.clone(),
         None => {
-            return Json(MediaResult {
-                media_type: "unsupported".to_string(),
-                data: None,
-                url: None,
-                format: String::new(),
-                filename: String::new(),
-            })
+            return if params.raw {
+                let mut resp = (axum::http::StatusCode::NOT_FOUND, "unsupported").into_response();
+                resp.headers_mut().insert("x-media-status", axum::http::HeaderValue::from_static("unsupported"));
+                resp
+            } else {
+                Json(MediaResult {
+                    media_type: "unsupported".to_string(),
+                    data: None,
+                    url: None,
+                    format: String::new(),
+                    filename: String::new(),
+                    role: None,
+                    file_path: None,
+                }).into_response()
+            };
         }
     };
 
@@ -136,13 +162,127 @@ pub async fn get_media(Path((chat_id, local_id)): Path<(String, i64)>) -> Json<M
         get_image_keys(&db, &session.id, &logged_in_user)
     };
 
-    Json(get_message_media(
+    let media = get_message_media(
         &logged_in_user,
         &keys,
         &chat_id,
         local_id,
         image_keys,
-    ))
+    );
+
+    if !params.raw {
+        return Json(media).into_response();
+    }
+
+    if media.media_type == "unsupported" {
+        let mut resp = (axum::http::StatusCode::NOT_FOUND, "unsupported").into_response();
+        resp.headers_mut().insert("x-media-status", axum::http::HeaderValue::from_static("unsupported"));
+        return resp;
+    }
+
+    if media.media_type == "pending" {
+        let mut resp = (axum::http::StatusCode::ACCEPTED, "pending").into_response();
+        resp.headers_mut().insert("x-media-status", axum::http::HeaderValue::from_static("pending"));
+        return resp;
+    }
+
+    // 1. URL-backed sticker/media:
+    if let Some(ref url) = media.url {
+        let mut resp = axum::response::Response::new(axum::body::Body::empty());
+        let headers = resp.headers_mut();
+        if let Ok(val) = axum::http::HeaderValue::from_str(url) {
+            headers.insert("x-media-url", val);
+        }
+        headers.insert("x-media-status", axum::http::HeaderValue::from_static("ready"));
+        let role_str = media.role.as_deref().unwrap_or("original");
+        if let Ok(val) = axum::http::HeaderValue::from_str(role_str) {
+            headers.insert("x-media-role", val);
+        }
+        if let Ok(val) = axum::http::HeaderValue::from_str(&media.filename) {
+            headers.insert("x-media-filename", val);
+        }
+        return resp;
+    }
+
+    // 2. Streamable file on disk:
+    if let Some(ref path_str) = media.file_path {
+        let path = std::path::Path::new(path_str);
+        if let Ok(file) = tokio::fs::File::open(path).await {
+            let stream = tokio_util::io::ReaderStream::new(file);
+            let body = axum::body::Body::from_stream(stream);
+            let mime = match media.format.to_lowercase().as_str() {
+                "jpg" | "jpeg" => "image/jpeg",
+                "png" => "image/png",
+                "gif" => "image/gif",
+                "mp3" => "audio/mpeg",
+                "mp4" => "video/mp4",
+                "pdf" => "application/pdf",
+                _ => "application/octet-stream",
+            };
+            let mut resp = axum::response::Response::new(body);
+            let headers = resp.headers_mut();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_str(mime).unwrap_or(axum::http::HeaderValue::from_static("application/octet-stream")),
+            );
+            if let Ok(metadata) = path.metadata() {
+                headers.insert(
+                    axum::http::header::CONTENT_LENGTH,
+                    axum::http::HeaderValue::from(metadata.len()),
+                );
+            }
+            let disp = format!("inline; filename=\"{}\"", media.filename);
+            if let Ok(val) = axum::http::HeaderValue::from_str(&disp) {
+                headers.insert(axum::http::header::CONTENT_DISPOSITION, val);
+            }
+            headers.insert("x-media-status", axum::http::HeaderValue::from_static("ready"));
+            let role_str = media.role.as_deref().unwrap_or("original");
+            if let Ok(val) = axum::http::HeaderValue::from_str(role_str) {
+                headers.insert("x-media-role", val);
+            }
+            if let Ok(val) = axum::http::HeaderValue::from_str(&media.filename) {
+                headers.insert("x-media-filename", val);
+            }
+            return resp;
+        }
+    }
+
+    // 3. In-memory base64 data:
+    if let Some(b64) = media.data {
+        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &b64).unwrap_or_default();
+        let mime = match media.format.to_lowercase().as_str() {
+            "jpg" | "jpeg" => "image/jpeg",
+            "png" => "image/png",
+            "gif" => "image/gif",
+            "mp3" => "audio/mpeg",
+            "mp4" => "video/mp4",
+            "pdf" => "application/pdf",
+            _ => "application/octet-stream",
+        };
+        let mut resp = axum::response::Response::new(axum::body::Body::from(bytes));
+        let headers = resp.headers_mut();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_str(mime).unwrap_or(axum::http::HeaderValue::from_static("application/octet-stream")),
+        );
+        let disp = format!("inline; filename=\"{}\"", media.filename);
+        if let Ok(val) = axum::http::HeaderValue::from_str(&disp) {
+            headers.insert(axum::http::header::CONTENT_DISPOSITION, val);
+        }
+        headers.insert("x-media-status", axum::http::HeaderValue::from_static("ready"));
+        let role_str = media.role.as_deref().unwrap_or("original");
+        if let Ok(val) = axum::http::HeaderValue::from_str(role_str) {
+            headers.insert("x-media-role", val);
+        }
+        if let Ok(val) = axum::http::HeaderValue::from_str(&media.filename) {
+            headers.insert("x-media-filename", val);
+        }
+        return resp;
+    }
+
+    let mut resp = (axum::http::StatusCode::ACCEPTED, "pending").into_response();
+    resp.headers_mut().insert("x-media-status", axum::http::HeaderValue::from_static("pending"));
+    resp
 }
 
 #[derive(Deserialize)]

@@ -52,8 +52,8 @@ tokio-tungstenite = "0.26"
 # Async trait support
 async-trait = "0.1"
 
-# Cancellation
-tokio-util = "0.7"
+# Cancellation and IO streaming
+tokio-util = { version = "0.7", features = ["io"] }
 
 # TypeScript type generation
 ts-rs = "10"

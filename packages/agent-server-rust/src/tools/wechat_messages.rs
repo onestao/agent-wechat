@@ -62,7 +62,7 @@ fn extract_group_sender(content: &str) -> (Option<String>, String) {
 
 /// Clean message content for display based on message type.
 /// Replaces verbose XML with concise summaries.
-fn clean_content(content: &str, msg_type: i32) -> String {
+pub(crate) fn clean_content(content: &str, msg_type: i32) -> String {
     let base = msg_type & 0x7FFFFFFF;
     match base {
         // Image (type 3): replace XML with empty string
@@ -105,7 +105,7 @@ fn clean_content(content: &str, msg_type: i32) -> String {
 }
 
 /// Extract reply info from type 49 (appmsg) messages with <refermsg>.
-fn extract_reply_info(content: &str, msg_type: i32) -> Option<ReplyInfo> {
+pub(crate) fn extract_reply_info(content: &str, msg_type: i32) -> Option<ReplyInfo> {
     let base = msg_type & 0x7FFFFFFF;
     if base != 49 || !content.contains("<refermsg>") {
         return None;
@@ -249,7 +249,7 @@ pub fn list_messages(
                     n.user_name as sender_name
              FROM \"{table_name}\" m
              LEFT JOIN Name2Id n ON m.real_sender_id = n.rowid
-             ORDER BY m.create_time DESC
+             ORDER BY m.create_time DESC, m.local_id DESC
              LIMIT {limit} OFFSET {offset};"
         ),
     );
@@ -391,6 +391,8 @@ pub fn list_messages(
                 .and_then(|wxid| contact_names.get(wxid))
                 .cloned();
 
+            let (kind, subtype, filename) = classify_message(&body, msg_type, &reply);
+
             Some(Message {
                 local_id,
                 server_id,
@@ -403,7 +405,141 @@ pub fn list_messages(
                 is_mentioned,
                 is_self,
                 reply,
+                kind,
+                subtype,
+                filename,
             })
         })
         .collect()
+}
+
+pub(crate) fn classify_message(
+    body: &str,
+    msg_type: i32,
+    reply: &Option<ReplyInfo>,
+) -> (Option<String>, Option<i32>, Option<String>) {
+    let base_type = msg_type & 0x7FFFFFFF;
+    match base_type {
+        1 => (Some("text".to_string()), None, None),
+        3 => (Some("image".to_string()), None, None),
+        34 => (Some("voice".to_string()), None, None),
+        43 => (Some("video".to_string()), None, None),
+        47 => (Some("sticker".to_string()), None, None),
+        10000 | 10002 => (Some("system".to_string()), None, None),
+        49 => {
+            let appmsg_type = if body.contains("<msg>") {
+                extract_xml_tag(body, "type")
+                    .and_then(|t| t.parse::<i32>().ok())
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            if reply.is_some() {
+                (Some("reply".to_string()), if appmsg_type > 0 { Some(appmsg_type) } else { Some(57) }, None)
+            } else if appmsg_type == 6 {
+                let fname = extract_xml_tag(body, "title");
+                (Some("file".to_string()), Some(6), fname)
+            } else if appmsg_type == 5 || appmsg_type == 3 || appmsg_type == 4 {
+                (Some("link".to_string()), Some(appmsg_type), None)
+            } else {
+                (Some("unknown".to_string()), if appmsg_type > 0 { Some(appmsg_type) } else { None }, None)
+            }
+        }
+        _ => (Some("unknown".to_string()), None, None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_type1_text() {
+        let text = "Hello from WeChat Hub";
+        let cleaned = clean_content(text, 1);
+        assert_eq!(cleaned, "Hello from WeChat Hub");
+        let (kind, subtype, filename) = classify_message(text, 1, &None);
+        assert_eq!(kind, Some("text".to_string()));
+        assert_eq!(subtype, None);
+        assert_eq!(filename, None);
+    }
+
+    #[test]
+    fn test_type3_image() {
+        let xml = r#"<msg><img hdlength="0" length="12345" /></msg>"#;
+        let cleaned = clean_content(xml, 3);
+        assert_eq!(cleaned, "");
+        let (kind, subtype, filename) = classify_message(xml, 3, &None);
+        assert_eq!(kind, Some("image".to_string()));
+        assert_eq!(subtype, None);
+        assert_eq!(filename, None);
+    }
+
+    #[test]
+    fn test_type47_sticker() {
+        let xml = r#"<msg><emoji cdnurl="https://res.wx.qq.com/emoji/test.gif" md5="a1b2c3d4" /></msg>"#;
+        let cleaned = clean_content(xml, 47);
+        assert_eq!(cleaned, "https://res.wx.qq.com/emoji/test.gif");
+        let (kind, subtype, filename) = classify_message(xml, 47, &None);
+        assert_eq!(kind, Some("sticker".to_string()));
+        assert_eq!(subtype, None);
+        assert_eq!(filename, None);
+    }
+
+    #[test]
+    fn test_type49_subtype5_link() {
+        let xml = r#"<msg><appmsg><type>5</type><title>Documentation</title><des>Product guides</des><url>https://example.com/docs?a=1&amp;b=2</url></appmsg></msg>"#;
+        let cleaned = clean_content(xml, 49);
+        assert!(cleaned.contains("[Link] Documentation"));
+        assert!(cleaned.contains("Product guides"));
+        assert!(cleaned.contains("https://example.com/docs?a=1&b=2"));
+
+        let (kind, subtype, filename) = classify_message(xml, 49, &None);
+        assert_eq!(kind, Some("link".to_string()));
+        assert_eq!(subtype, Some(5));
+        assert_eq!(filename, None);
+    }
+
+    #[test]
+    fn test_type49_subtype6_file() {
+        let xml = r#"<msg><appmsg><type>6</type><title>report_2026.pdf</title><fileext>pdf</fileext></appmsg></msg>"#;
+        let cleaned = clean_content(xml, 49);
+        assert_eq!(cleaned, "report_2026.pdf");
+
+        let (kind, subtype, filename) = classify_message(xml, 49, &None);
+        assert_eq!(kind, Some("file".to_string()));
+        assert_eq!(subtype, Some(6));
+        assert_eq!(filename, Some("report_2026.pdf".to_string()));
+    }
+
+    #[test]
+    fn test_refermsg_reply() {
+        let xml = r#"<msg><appmsg><type>57</type><title>I agree with this</title><refermsg><type>1</type><svrid>987654321</svrid><fromusr>wxid_sender1</fromusr><chatusr>group@chatroom</chatusr><displayname>Alice</displayname><content>Original idea</content></refermsg></appmsg></msg>"#;
+        let reply_info = extract_reply_info(xml, 49);
+        assert!(reply_info.is_some());
+        let r = reply_info.as_ref().unwrap();
+        assert_eq!(r.sender, Some("Alice".to_string()));
+        assert_eq!(r.content, "Original idea");
+
+        let (kind, subtype, filename) = classify_message(xml, 49, &reply_info);
+        assert_eq!(kind, Some("reply".to_string()));
+        assert_eq!(subtype, Some(57));
+        assert_eq!(filename, None);
+    }
+
+    #[test]
+    fn test_unknown_subtypes() {
+        // Appmsg with unknown subtype
+        let xml = r#"<msg><appmsg><type>999</type><title>Future Feature</title></appmsg></msg>"#;
+        let (kind, subtype, filename) = classify_message(xml, 49, &None);
+        assert_eq!(kind, Some("unknown".to_string()));
+        assert_eq!(subtype, Some(999));
+        assert_eq!(filename, None);
+
+        // Unknown base type
+        let (kind2, subtype2, filename2) = classify_message("opaque content", 123456, &None);
+        assert_eq!(kind2, Some("unknown".to_string()));
+        assert_eq!(subtype2, None);
+        assert_eq!(filename2, None);
+    }
 }
