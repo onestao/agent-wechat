@@ -14,7 +14,7 @@ use crate::plans::send_message::{SendMessageParams, SendMessagePlan};
 use crate::sessions::manager::get_session;
 use crate::tools::wechat_db::{find_wechat_pid, list_account_dbs};
 use crate::tools::wechat_keys::{extract_keys_async, get_image_keys, get_stored_keys, store_keys};
-use crate::tools::wechat_media::get_message_media;
+use crate::tools::wechat_media::{get_message_media, lookup_message_raw};
 use crate::tools::wechat_messages;
 
 #[derive(Deserialize)]
@@ -141,20 +141,78 @@ pub async fn get_media(
         get_stored_keys(&db, &session.id, &logged_in_user)
     };
 
-    // Lazy key extraction: if media_*.db files exist on disk without stored keys, extract them
-    let on_disk = list_account_dbs(&logged_in_user);
-    let has_missing_media = on_disk.iter().any(|name| {
-        name.starts_with("media_") && name.ends_with(".db") && !keys.contains_key(name.as_str())
-    });
-    if has_missing_media {
-        if let Some(pid) = find_wechat_pid() {
-            let extracted = extract_keys_async(pid).await;
-            if !extracted.is_empty() {
-                let db = get_db();
-                store_keys(&db, &session.id, &logged_in_user, &extracted);
-                keys = get_stored_keys(&db, &session.id, &logged_in_user);
-            }
+    // 1. Determine message type FIRST from message DB.
+    let (local_type, _create_time, _content) = match lookup_message_raw(&logged_in_user, &keys, &chat_id, local_id) {
+        Some(t) => t,
+        None => {
+            return if params.raw {
+                let mut resp = (axum::http::StatusCode::NOT_FOUND, "unsupported").into_response();
+                resp.headers_mut().insert("x-media-status", axum::http::HeaderValue::from_static("unsupported"));
+                resp
+            } else {
+                Json(MediaResult {
+                    media_type: "unsupported".to_string(),
+                    data: None,
+                    url: None,
+                    format: String::new(),
+                    filename: String::new(),
+                    role: None,
+                    file_path: None,
+                }).into_response()
+            };
         }
+    };
+
+    let base_type = (local_type & 0xFFFFFFFF) as i32;
+
+    // 2. Single-flight key extraction:
+    // ONLY voice messages (type 34) are permitted to check or extract media_*.db keys.
+    // For image [3], sticker [47], video [43], file [49], zero media key extraction is performed.
+    let on_disk = list_account_dbs(&logged_in_user);
+    let session_id_clone = session.id.clone();
+    let logged_in_user_clone = logged_in_user.clone();
+    let reload_keys = move || {
+        let db = get_db();
+        get_stored_keys(&db, &session_id_clone, &logged_in_user_clone)
+    };
+    let session_id_clone2 = session.id.clone();
+    let logged_in_user_clone2 = logged_in_user.clone();
+    let save_keys = move |extracted: &std::collections::HashMap<String, String>| {
+        let db = get_db();
+        store_keys(&db, &session_id_clone2, &logged_in_user_clone2, extracted);
+    };
+    let pid_opt = find_wechat_pid();
+    let extract_fn = || async move {
+        if let Some(pid) = pid_opt {
+            extract_keys_async(pid).await
+        } else {
+            std::collections::HashMap::new()
+        }
+    };
+
+    if let Err(()) = ensure_media_keys_for_message(
+        base_type,
+        &on_disk,
+        &mut keys,
+        reload_keys,
+        save_keys,
+        extract_fn,
+    ).await {
+        return if params.raw {
+            let mut resp = (axum::http::StatusCode::ACCEPTED, "pending").into_response();
+            resp.headers_mut().insert("x-media-status", axum::http::HeaderValue::from_static("pending"));
+            resp
+        } else {
+            Json(MediaResult {
+                media_type: "pending".to_string(),
+                data: None,
+                url: None,
+                format: String::new(),
+                filename: String::new(),
+                role: None,
+                file_path: None,
+            }).into_response()
+        };
     }
 
     let image_keys = {
@@ -438,4 +496,248 @@ pub async fn send_message(Json(input): Json<SendParams>) -> Json<SendResult> {
         success: result.success,
         error: result.error,
     })
+}
+
+static VOICE_KEY_EXTRACTION_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Single-flight voice key extraction with double-checked locking.
+///
+/// Rules:
+/// 1. ONLY voice messages (base_type == 34) may check or extract media_*.db keys.
+/// 2. Image (3), sticker (47), video (43), and file (49) NEVER check or extract media keys.
+/// 3. Voice extraction is strictly single-flight: at most one in-flight extraction at any time.
+/// 4. Re-checks stored keys inside the lock to avoid duplicate extraction for queued requests.
+/// 5. Bounded timeouts: 5s lock acquisition, 8s extraction; returns Err(()) on timeout to prevent hanging.
+pub(crate) async fn ensure_media_keys_for_message<F, Fut, R, S>(
+    base_type: i32,
+    on_disk: &[String],
+    keys: &mut std::collections::HashMap<String, String>,
+    reload_keys: R,
+    save_keys: S,
+    extract_fn: F,
+) -> Result<bool, ()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = std::collections::HashMap<String, String>>,
+    R: Fn() -> std::collections::HashMap<String, String>,
+    S: Fn(&std::collections::HashMap<String, String>),
+{
+    if base_type != 34 {
+        return Ok(false);
+    }
+
+    let has_missing = on_disk.iter().any(|name| {
+        name.starts_with("media_") && name.ends_with(".db") && !keys.contains_key(name.as_str())
+    });
+    if !has_missing {
+        return Ok(false);
+    }
+
+    let _guard = match tokio::time::timeout(std::time::Duration::from_secs(5), VOICE_KEY_EXTRACTION_MUTEX.lock()).await {
+        Ok(g) => g,
+        Err(_) => {
+            tracing::warn!("[media] voice key extraction lock timed out after 5s");
+            return Err(());
+        }
+    };
+
+    *keys = reload_keys();
+    let still_missing = on_disk.iter().any(|name| {
+        name.starts_with("media_") && name.ends_with(".db") && !keys.contains_key(name.as_str())
+    });
+    if !still_missing {
+        return Ok(false);
+    }
+
+    match tokio::time::timeout(std::time::Duration::from_secs(8), extract_fn()).await {
+        Ok(extracted) => {
+            if !extracted.is_empty() {
+                save_keys(&extracted);
+                *keys = reload_keys();
+            }
+            Ok(true)
+        }
+        Err(_) => {
+            tracing::warn!("[media] extract_keys timed out after 8s");
+            Err(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_image_with_missing_unrelated_media_key_does_not_extract() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = counter.clone();
+        let mut keys = std::collections::HashMap::new();
+        keys.insert("message_1.db".to_string(), "key1".to_string());
+        let on_disk = vec!["message_1.db".to_string(), "media_99.db".to_string()];
+        let keys_snap = keys.clone();
+
+        let res = ensure_media_keys_for_message(
+            3, // image
+            &on_disk,
+            &mut keys,
+            move || keys_snap.clone(),
+            |_| {},
+            || async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                std::collections::HashMap::new()
+            },
+        ).await;
+
+        assert_eq!(res, Ok(false));
+        assert_eq!(counter.load(Ordering::SeqCst), 0, "image with missing unrelated media key must not trigger extraction");
+    }
+
+    #[tokio::test]
+    async fn test_sticker_with_missing_unrelated_media_key_does_not_extract() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = counter.clone();
+        let mut keys = std::collections::HashMap::new();
+        let on_disk = vec!["media_1.db".to_string()];
+        let keys_snap = keys.clone();
+
+        let res = ensure_media_keys_for_message(
+            47, // sticker
+            &on_disk,
+            &mut keys,
+            move || keys_snap.clone(),
+            |_| {},
+            || async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                std::collections::HashMap::new()
+            },
+        ).await;
+
+        assert_eq!(res, Ok(false));
+        assert_eq!(counter.load(Ordering::SeqCst), 0, "sticker with missing unrelated media key must not trigger extraction");
+    }
+
+    #[tokio::test]
+    async fn test_video_does_not_extract() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = counter.clone();
+        let mut keys = std::collections::HashMap::new();
+        let on_disk = vec!["media_1.db".to_string()];
+        let keys_snap = keys.clone();
+
+        let res = ensure_media_keys_for_message(
+            43, // video
+            &on_disk,
+            &mut keys,
+            move || keys_snap.clone(),
+            |_| {},
+            || async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                std::collections::HashMap::new()
+            },
+        ).await;
+
+        assert_eq!(res, Ok(false));
+        assert_eq!(counter.load(Ordering::SeqCst), 0, "video must not trigger extraction");
+    }
+
+    #[tokio::test]
+    async fn test_file_does_not_extract() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = counter.clone();
+        let mut keys = std::collections::HashMap::new();
+        let on_disk = vec!["media_1.db".to_string()];
+        let keys_snap = keys.clone();
+
+        let res = ensure_media_keys_for_message(
+            49, // file
+            &on_disk,
+            &mut keys,
+            move || keys_snap.clone(),
+            |_| {},
+            || async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                std::collections::HashMap::new()
+            },
+        ).await;
+
+        assert_eq!(res, Ok(false));
+        assert_eq!(counter.load(Ordering::SeqCst), 0, "file must not trigger extraction");
+    }
+
+    #[tokio::test]
+    async fn test_voice_missing_media_key_triggers_exactly_once() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = counter.clone();
+        let mut keys = std::collections::HashMap::new();
+        let on_disk = vec!["media_0.db".to_string()];
+        let keys_snap = keys.clone();
+
+        let res = ensure_media_keys_for_message(
+            34, // voice
+            &on_disk,
+            &mut keys,
+            move || keys_snap.clone(),
+            |_| {},
+            || async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                let mut map = std::collections::HashMap::new();
+                map.insert("media_0.db".to_string(), "key0".to_string());
+                map
+            },
+        ).await;
+
+        assert_eq!(res, Ok(true));
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "voice missing media key must extract exactly once");
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_voice_requests_trigger_exactly_once() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let shared_keys = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let on_disk = vec!["media_0.db".to_string()];
+
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let c = counter.clone();
+            let sk = shared_keys.clone();
+            let od = on_disk.clone();
+            handles.push(tokio::spawn(async move {
+                let mut local_keys = sk.lock().unwrap().clone();
+                let reload = {
+                    let sk = sk.clone();
+                    move || sk.lock().unwrap().clone()
+                };
+                let save = {
+                    let sk = sk.clone();
+                    move |extracted: &std::collections::HashMap<String, String>| {
+                        sk.lock().unwrap().extend(extracted.clone());
+                    }
+                };
+                ensure_media_keys_for_message(
+                    34, // voice
+                    &od,
+                    &mut local_keys,
+                    reload,
+                    save,
+                    || async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        c.fetch_add(1, Ordering::SeqCst);
+                        let mut map = std::collections::HashMap::new();
+                        map.insert("media_0.db".to_string(), "key0".to_string());
+                        map
+                    },
+                ).await
+            }));
+        }
+
+        for h in handles {
+            let res = h.await.unwrap();
+            assert!(res.is_ok());
+        }
+
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "concurrent voice requests must extract exactly once");
+    }
 }

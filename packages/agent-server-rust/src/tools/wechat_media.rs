@@ -49,7 +49,7 @@ fn account_base_paths(account_dir: &str) -> [String; 2] {
 }
 
 /// Look up a single message's raw content by localId.
-fn lookup_message_raw(
+pub(crate) fn lookup_message_raw(
     account_dir: &str,
     keys: &HashMap<String, String>,
     chat_id: &str,
