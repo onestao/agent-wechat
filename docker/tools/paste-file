@@ -8,6 +8,8 @@
 # build in POSIX locale cannot resolve non-ASCII file:// URIs.
 
 set -euo pipefail
+export LANG=C.utf8
+export LC_ALL=C.utf8
 
 if [ -z "${1:-}" ]; then
   echo "Usage: paste-file <file-path>" >&2
@@ -23,18 +25,6 @@ fi
 
 # Convert to absolute path
 ABS_PATH="$(realpath "$FILE")"
-
-# If the path contains non-ASCII characters, copy to an ASCII-safe temp
-# path.  WeChat (Qt) under POSIX locale silently fails to open file://
-# URIs whose path includes non-ASCII bytes.
-if ! echo "$ABS_PATH" | iconv -f UTF-8 -t ASCII >/dev/null 2>&1; then
-  EXT="${ABS_PATH##*.}"
-  SAFE_PATH="/tmp/paste_safe_$(date +%s%N).${EXT}"
-  cp "$ABS_PATH" "$SAFE_PATH"
-  ABS_PATH="$SAFE_PATH"
-  # Schedule cleanup after WeChat has had time to read the file
-  (sleep 10 && rm -f "$SAFE_PATH") &
-fi
 
 # Copy file URI to clipboard (backgrounded — xclip blocks until
 # the selection is consumed, so it must run in parallel with the paste)

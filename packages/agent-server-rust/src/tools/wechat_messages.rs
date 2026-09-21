@@ -227,15 +227,14 @@ pub fn list_messages(
     chat_id: &str,
     limit: i64,
     offset: i64,
-) -> Vec<Message> {
+) -> Result<Vec<Message>, String> {
     let table_name = get_msg_table_name(chat_id);
     let is_group = chat_id.contains("@chatroom");
 
     let (db_name, key) = match find_message_db(account_dir, keys, chat_id) {
         Some(dk) => dk,
-        None => return Vec::new(),
+        None => return Ok(Vec::new()),
     };
-    let db_path = get_db_path(account_dir, &db_name);
 
     // Query messages using hex() for safe binary/compressed content extraction
     let msg_sql = format!(
@@ -251,15 +250,8 @@ pub fn list_messages(
          LIMIT {limit} OFFSET {offset};"
     );
 
-    let rows = match query_hot_wechat_db(account_dir, &db_name, key, &msg_sql) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(
-                "[wechat-messages] hot query failed for {db_name}: {e}, falling back to immutable"
-            );
-            query_wechat_db(&db_path, key, &msg_sql)
-        }
-    };
+    let rows = query_hot_wechat_db(account_dir, &db_name, key, &msg_sql)
+        .map_err(|e| format!("{db_name} hot query failed: {e}"))?;
 
     // Resolve sender display names from contact.db
     let contact_names: HashMap<String, String> = {
@@ -310,7 +302,8 @@ pub fn list_messages(
         map
     };
 
-    rows.iter()
+    Ok(rows
+        .iter()
         .filter_map(|row| {
             let local_id = row.get("local_id")?.as_i64()?;
             let server_id = row.get("server_id").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -417,7 +410,7 @@ pub fn list_messages(
                 filename,
             })
         })
-        .collect()
+        .collect())
 }
 
 pub(crate) fn classify_message(
@@ -565,5 +558,52 @@ mod tests {
         assert_eq!(kind2, Some("unknown".to_string()));
         assert_eq!(subtype2, None);
         assert_eq!(filename2, None);
+    }
+
+    #[test]
+    fn test_list_messages_fails_closed_when_hot_db_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let account_dir = tmp.path().to_str().unwrap();
+        let msg_dir = tmp.path().join("db_storage").join("message");
+        std::fs::create_dir_all(&msg_dir).unwrap();
+        let db_path = msg_dir.join("message_0.db");
+
+        let chat_id = "test_chat";
+        let table_name = get_msg_table_name(chat_id);
+        let valid_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        // Create an encrypted sqlite DB with the message table using SQLCipher
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(&format!(
+            "PRAGMA key = \"x'{valid_key}'\";
+             PRAGMA cipher_compatibility = 4;
+             CREATE TABLE \"{table_name}\" (
+                 local_id INTEGER PRIMARY KEY,
+                 server_id INTEGER,
+                 local_type INTEGER,
+                 create_time INTEGER,
+                 message_content BLOB,
+                 WCDB_CT_message_content INTEGER,
+                 source BLOB,
+                 WCDB_CT_source INTEGER,
+                 real_sender_id INTEGER
+             );"
+        ))
+        .unwrap();
+        drop(conn);
+
+        let mut keys = HashMap::new();
+        keys.insert("message_0.db".to_string(), valid_key.to_string());
+
+        // Point WECHAT_LIVE_DB_CACHE_DIR to an unwritable location so hot refresh fails
+        std::env::set_var("WECHAT_LIVE_DB_CACHE_DIR", "/proc/unwritable_dir/cache");
+
+        let res = list_messages(account_dir, &keys, chat_id, 50, 0);
+        assert!(res.is_err(), "Must return Err when hot DB query fails");
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("hot query failed"),
+            "Error must describe failure: {err}"
+        );
     }
 }

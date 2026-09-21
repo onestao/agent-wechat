@@ -1,5 +1,7 @@
 use axum::{
     extract::{Path, Query},
+    http::StatusCode,
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::Deserialize;
@@ -27,14 +29,14 @@ fn default_limit() -> i64 {
     50
 }
 
-pub async fn list_chats(Query(params): Query<ListParams>) -> Json<Vec<Chat>> {
+pub async fn list_chats(Query(params): Query<ListParams>) -> Response {
     let session = match get_session("default") {
         Some(s) => s,
-        None => return Json(Vec::new()),
+        None => return (StatusCode::OK, Json(Vec::<Chat>::new())).into_response(),
     };
     let logged_in_user = match &session.logged_in_user {
         Some(u) => u.clone(),
-        None => return Json(Vec::new()),
+        None => return (StatusCode::OK, Json(Vec::<Chat>::new())).into_response(),
     };
 
     let mut keys = {
@@ -61,15 +63,25 @@ pub async fn list_chats(Query(params): Query<ListParams>) -> Json<Vec<Chat>> {
     }
 
     if !keys.contains_key("session.db") || !keys.contains_key("contact.db") {
-        return Json(Vec::new());
+        return (StatusCode::OK, Json(Vec::<Chat>::new())).into_response();
     }
 
-    Json(wechat_chats::list_chats(
-        &logged_in_user,
-        &keys,
-        params.limit,
-        params.offset,
-    ))
+    match wechat_chats::list_chats(&logged_in_user, &keys, params.limit, params.offset) {
+        Ok(chats) => (StatusCode::OK, Json(chats)).into_response(),
+        Err(err) => {
+            tracing::error!("[router/chats] list_chats failed: {err}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "hot_db_unavailable",
+                        "message": format!("Hot DB snapshot query failed: {err}")
+                    }
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 pub async fn get_chat(Path(id): Path<String>) -> Json<Option<Chat>> {

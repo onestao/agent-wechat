@@ -646,7 +646,7 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_same_db_read_single_refresh() {
+    fn test_concurrent_same_db_refresh_is_serialized() {
         use std::sync::atomic::AtomicUsize;
         let counter = Arc::new(AtomicUsize::new(0));
         let mut handles = Vec::new();
@@ -668,32 +668,76 @@ mod tests {
     }
 
     #[test]
-    fn test_list_chats_does_not_touch_message_db() {
+    fn test_cache_directories_are_strictly_isolated_per_db() {
         let tmp = tempfile::tempdir().unwrap();
         let cache_root = tmp.path().join("cache");
         std::env::set_var("WECHAT_LIVE_DB_CACHE_DIR", cache_root.to_str().unwrap());
 
         let session_cache = get_cache_dir("test_session", "session.db");
-        std::fs::create_dir_all(&session_cache).unwrap();
-        File::create(session_cache.join("session.db")).unwrap();
+        let msg0_cache = get_cache_dir("test_session", "message_0.db");
+        let msg1_cache = get_cache_dir("test_session", "message_1.db");
 
-        // Verify message DB cache was never created
-        let msg_cache = get_cache_dir("test_session", "message_0.db");
-        assert!(!msg_cache.exists());
+        assert_ne!(session_cache, msg0_cache);
+        assert_ne!(msg0_cache, msg1_cache);
+        assert!(session_cache.ends_with("session.db"));
+        assert!(msg0_cache.ends_with("message_0.db"));
     }
 
     #[test]
-    fn test_list_messages_only_refreshes_actual_shard() {
+    fn test_source_db_remains_completely_unmodified_after_snapshot_read() {
         let tmp = tempfile::tempdir().unwrap();
         let cache_root = tmp.path().join("cache");
         std::env::set_var("WECHAT_LIVE_DB_CACHE_DIR", cache_root.to_str().unwrap());
 
-        let msg0_cache = get_cache_dir("test_session", "message_0.db");
-        std::fs::create_dir_all(&msg0_cache).unwrap();
-        File::create(msg0_cache.join("message_0.db")).unwrap();
+        let account_dir = tmp.path().to_str().unwrap();
+        let session_dir = tmp.path().join("db_storage").join("session");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let db_path = session_dir.join("session.db");
+        let wal_path = session_dir.join("session.db-wal");
 
-        // Verify other message shards were not created
-        let msg1_cache = get_cache_dir("test_session", "message_1.db");
-        assert!(!msg1_cache.exists());
+        let mut db_bytes = vec![0u8; 4096];
+        db_bytes[0..16].copy_from_slice(b"SQLite format 3\0");
+        File::create(&db_path)
+            .unwrap()
+            .write_all(&db_bytes)
+            .unwrap();
+
+        let mut wal_bytes = vec![0u8; 1024];
+        wal_bytes[0..4].copy_from_slice(&0x377f0682u32.to_le_bytes());
+        wal_bytes[12..20].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        File::create(&wal_path)
+            .unwrap()
+            .write_all(&wal_bytes)
+            .unwrap();
+
+        let initial_db_meta = std::fs::metadata(&db_path).unwrap();
+        let initial_wal_meta = std::fs::metadata(&wal_path).unwrap();
+        let initial_entries: Vec<_> = std::fs::read_dir(&session_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+
+        let res = refresh_snapshot(account_dir, "session.db", "default");
+        assert!(res.is_ok());
+
+        // Assert source directory was completely unmodified
+        let final_entries: Vec<_> = std::fs::read_dir(&session_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(initial_entries, final_entries);
+
+        let final_db_meta = std::fs::metadata(&db_path).unwrap();
+        let final_wal_meta = std::fs::metadata(&wal_path).unwrap();
+        assert_eq!(initial_db_meta.len(), final_db_meta.len());
+        assert_eq!(initial_wal_meta.len(), final_wal_meta.len());
+        assert_eq!(
+            initial_db_meta.modified().unwrap(),
+            final_db_meta.modified().unwrap()
+        );
+        assert_eq!(
+            initial_wal_meta.modified().unwrap(),
+            final_wal_meta.modified().unwrap()
+        );
     }
 }

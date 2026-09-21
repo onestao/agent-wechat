@@ -9,17 +9,16 @@ pub fn list_chats(
     keys: &HashMap<String, String>,
     limit: i64,
     offset: i64,
-) -> Vec<Chat> {
+) -> Result<Vec<Chat>, String> {
     let session_key = match keys.get("session.db") {
         Some(k) => k,
-        None => return Vec::new(),
+        None => return Ok(Vec::new()),
     };
     let contact_key = match keys.get("contact.db") {
         Some(k) => k,
-        None => return Vec::new(),
+        None => return Ok(Vec::new()),
     };
 
-    let session_db = get_db_path(account_dir, "session.db");
     let contact_db = get_db_path(account_dir, "contact.db");
 
     let session_sql = format!(
@@ -32,18 +31,11 @@ pub fn list_chats(
          LIMIT {limit} OFFSET {offset};"
     );
 
-    let sessions = match query_hot_wechat_db(account_dir, "session.db", session_key, &session_sql) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(
-                "[wechat-chats] hot query failed for session.db: {e}, falling back to immutable"
-            );
-            query_wechat_db(&session_db, session_key, &session_sql)
-        }
-    };
+    let sessions = query_hot_wechat_db(account_dir, "session.db", session_key, &session_sql)
+        .map_err(|e| format!("session.db hot query failed: {e}"))?;
 
     if sessions.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     // Batch lookup contacts
@@ -77,7 +69,7 @@ pub fn list_chats(
         }
     }
 
-    sessions
+    Ok(sessions
         .iter()
         .filter_map(|session| {
             let username = session.get("username")?.as_str()?.to_string();
@@ -156,7 +148,7 @@ pub fn list_chats(
                 last_msg_local_id,
             })
         })
-        .collect()
+        .collect())
 }
 
 /// Find a chat by WeChat username (exact match).
@@ -380,4 +372,24 @@ pub fn find_chats_by_name(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_list_chats_fails_closed_when_hot_db_unavailable() {
+        let mut keys = HashMap::new();
+        keys.insert("session.db".to_string(), "dummy_key".to_string());
+        keys.insert("contact.db".to_string(), "dummy_key".to_string());
+
+        let res = list_chats("/nonexistent/path", &keys, 50, 0);
+        assert!(res.is_err(), "Must return Err when hot DB query fails");
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("hot query failed"),
+            "Error must describe failure: {err}"
+        );
+    }
 }

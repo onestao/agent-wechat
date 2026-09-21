@@ -196,6 +196,16 @@ pub fn get_db_path(account_dir: &str, db_name: &str) -> String {
         .map(|(_, dir)| *dir)
         .unwrap_or_else(|| db_name.strip_suffix(".db").unwrap_or(db_name));
 
+    if account_dir.starts_with('/') {
+        let direct_path = Path::new(account_dir)
+            .join("db_storage")
+            .join(sub_dir)
+            .join(db_name);
+        if direct_path.exists() {
+            return direct_path.to_string_lossy().to_string();
+        }
+    }
+
     let base_paths = [
         format!("/home/wechat/xwechat_files/{account_dir}"),
         format!("/home/wechat/Documents/xwechat_files/{account_dir}"),

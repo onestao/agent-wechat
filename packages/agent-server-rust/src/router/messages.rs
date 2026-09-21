@@ -1,6 +1,7 @@
 use axum::{
     extract::{Path, Query},
-    response::IntoResponse,
+    http::StatusCode,
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::Deserialize;
@@ -32,14 +33,14 @@ fn default_limit() -> i64 {
 pub async fn list_messages(
     Path(chat_id): Path<String>,
     Query(params): Query<ListParams>,
-) -> Json<Vec<Message>> {
+) -> Response {
     let session = match get_session("default") {
         Some(s) => s,
-        None => return Json(Vec::new()),
+        None => return (StatusCode::OK, Json(Vec::<Message>::new())).into_response(),
     };
     let logged_in_user = match &session.logged_in_user {
         Some(u) => u.clone(),
-        None => return Json(Vec::new()),
+        None => return (StatusCode::OK, Json(Vec::<Message>::new())).into_response(),
     };
 
     let mut keys = {
@@ -73,16 +74,31 @@ pub async fn list_messages(
             && !k.contains("fts")
             && !k.contains("resource")
     }) {
-        return Json(Vec::new());
+        return (StatusCode::OK, Json(Vec::<Message>::new())).into_response();
     }
 
-    Json(wechat_messages::list_messages(
+    match wechat_messages::list_messages(
         &logged_in_user,
         &keys,
         &chat_id,
         params.limit,
         params.offset,
-    ))
+    ) {
+        Ok(msgs) => (StatusCode::OK, Json(msgs)).into_response(),
+        Err(err) => {
+            tracing::error!("[router/messages] list_messages failed: {err}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "hot_db_unavailable",
+                        "message": format!("Hot DB snapshot query failed: {err}")
+                    }
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -422,6 +438,16 @@ pub fn sanitize_send_filename(raw: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+struct TempDirGuard(Option<std::path::PathBuf>);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        if let Some(dir) = self.0.take() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
 pub async fn send_message(Json(input): Json<SendParams>) -> Json<SendResult> {
     if input.text.is_none() && input.image.is_none() && input.file.is_none() {
         return Json(SendResult {
@@ -476,7 +502,7 @@ pub async fn send_message(Json(input): Json<SendParams>) -> Json<SendResult> {
 
     // Decode base64 file to temp file with original basename preserved
     let mut file_path: Option<String> = None;
-    let mut temp_send_dir: Option<std::path::PathBuf> = None;
+    let mut _temp_send_dir_guard = TempDirGuard(None);
     if let Some(ref f) = input.file {
         let safe_name = match sanitize_send_filename(&f.filename) {
             Ok(s) => s,
@@ -502,7 +528,7 @@ pub async fn send_message(Json(input): Json<SendParams>) -> Json<SendResult> {
             Ok(bytes) => match std::fs::write(&full_path, &bytes) {
                 Ok(_) => {
                     file_path = Some(full_path.to_string_lossy().to_string());
-                    temp_send_dir = Some(send_dir);
+                    _temp_send_dir_guard = TempDirGuard(Some(send_dir));
                 }
                 Err(e) => {
                     let _ = std::fs::remove_dir_all(&send_dir);
@@ -541,15 +567,9 @@ pub async fn send_message(Json(input): Json<SendParams>) -> Json<SendResult> {
     let (result, _plan_state) =
         run_execution_loop(&plan, &params, &mut context, &noop_emit, cancel).await;
 
-    // Clean up temp files
+    // Clean up temp image file (temp file_path and its parent dir are cleaned up by _temp_send_dir_guard RAII drop)
     if let Some(p) = &image_path {
         let _ = std::fs::remove_file(p);
-    }
-    if let Some(p) = &file_path {
-        let _ = std::fs::remove_file(p);
-    }
-    if let Some(dir) = &temp_send_dir {
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     Json(SendResult {

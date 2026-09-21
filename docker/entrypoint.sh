@@ -4,6 +4,8 @@ set -euo pipefail
 # ============================================
 # Environment setup
 # ============================================
+export LANG=C.utf8
+export LC_ALL=C.utf8
 export DISPLAY=${DISPLAY:-:99}
 export QT_ACCESSIBILITY=${QT_ACCESSIBILITY:-1}
 export QT_LINUX_ACCESSIBILITY_ALWAYS_ON=${QT_LINUX_ACCESSIBILITY_ALWAYS_ON:-1}
