@@ -1,4 +1,5 @@
 use super::wechat_db::{get_db_path, query_wechat_db};
+use super::wechat_live_db::query_hot_wechat_db;
 use crate::ia::types::{Message, ReplyInfo};
 use md5::{Digest, Md5};
 use std::collections::HashMap;
@@ -237,22 +238,28 @@ pub fn list_messages(
     let db_path = get_db_path(account_dir, &db_name);
 
     // Query messages using hex() for safe binary/compressed content extraction
-    let rows = query_wechat_db(
-        &db_path,
-        key,
-        &format!(
-            "SELECT m.local_id, m.server_id, m.local_type, m.create_time,
-                    hex(m.message_content) as hex_content,
-                    m.WCDB_CT_message_content as is_compressed,
-                    hex(m.source) as hex_source,
-                    m.WCDB_CT_source as source_compressed,
-                    n.user_name as sender_name
-             FROM \"{table_name}\" m
-             LEFT JOIN Name2Id n ON m.real_sender_id = n.rowid
-             ORDER BY m.create_time DESC, m.local_id DESC
-             LIMIT {limit} OFFSET {offset};"
-        ),
+    let msg_sql = format!(
+        "SELECT m.local_id, m.server_id, m.local_type, m.create_time,
+                hex(m.message_content) as hex_content,
+                m.WCDB_CT_message_content as is_compressed,
+                hex(m.source) as hex_source,
+                m.WCDB_CT_source as source_compressed,
+                n.user_name as sender_name
+         FROM \"{table_name}\" m
+         LEFT JOIN Name2Id n ON m.real_sender_id = n.rowid
+         ORDER BY m.create_time DESC, m.local_id DESC
+         LIMIT {limit} OFFSET {offset};"
     );
+
+    let rows = match query_hot_wechat_db(account_dir, &db_name, key, &msg_sql) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                "[wechat-messages] hot query failed for {db_name}: {e}, falling back to immutable"
+            );
+            query_wechat_db(&db_path, key, &msg_sql)
+        }
+    };
 
     // Resolve sender display names from contact.db
     let contact_names: HashMap<String, String> = {

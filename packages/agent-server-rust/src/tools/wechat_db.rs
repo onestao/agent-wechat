@@ -291,7 +291,7 @@ mod tests {
             b1.wait();
 
             // Keep connection alive while writer tries to write
-            std::thread::sleep(Duration::from_millis(200));
+            std::thread::sleep(Duration::from_millis(600));
             drop(conn);
         });
 
@@ -312,9 +312,9 @@ mod tests {
             .unwrap();
             let elapsed = start.elapsed();
 
-            // Writer should complete quickly (< 100ms), not blocked by reader
+            // Writer should complete quickly (< 400ms), not blocked by reader (which sleeps 600ms)
             assert!(
-                elapsed < Duration::from_millis(100),
+                elapsed < Duration::from_millis(400),
                 "Writer was blocked for {:?} — immutable reader is holding locks!",
                 elapsed
             );

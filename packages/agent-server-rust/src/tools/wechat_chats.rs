@@ -1,4 +1,5 @@
 use super::wechat_db::{get_db_path, query_wechat_db};
+use super::wechat_live_db::query_hot_wechat_db;
 use crate::ia::types::Chat;
 use std::collections::HashMap;
 
@@ -21,19 +22,25 @@ pub fn list_chats(
     let session_db = get_db_path(account_dir, "session.db");
     let contact_db = get_db_path(account_dir, "contact.db");
 
-    let sessions = query_wechat_db(
-        &session_db,
-        session_key,
-        &format!(
-            "SELECT username, type, unread_count, summary, draft, last_timestamp,
-                    sort_timestamp, last_msg_sender, last_sender_display_name, is_hidden,
-                    last_msg_locald_id
-             FROM SessionTable
-             WHERE is_hidden = 0
-             ORDER BY sort_timestamp DESC
-             LIMIT {limit} OFFSET {offset};"
-        ),
+    let session_sql = format!(
+        "SELECT username, type, unread_count, summary, draft, last_timestamp,
+                sort_timestamp, last_msg_sender, last_sender_display_name, is_hidden,
+                last_msg_locald_id
+         FROM SessionTable
+         WHERE is_hidden = 0
+         ORDER BY sort_timestamp DESC
+         LIMIT {limit} OFFSET {offset};"
     );
+
+    let sessions = match query_hot_wechat_db(account_dir, "session.db", session_key, &session_sql) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                "[wechat-chats] hot query failed for session.db: {e}, falling back to immutable"
+            );
+            query_wechat_db(&session_db, session_key, &session_sql)
+        }
+    };
 
     if sessions.is_empty() {
         return Vec::new();

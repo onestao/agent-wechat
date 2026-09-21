@@ -402,6 +402,26 @@ pub struct FileInput {
     filename: String,
 }
 
+pub fn sanitize_send_filename(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("Filename cannot be empty".to_string());
+    }
+    if trimmed.chars().any(|c| c.is_control() || c == '\0') {
+        return Err("Filename contains control characters".to_string());
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return Err("Filename cannot contain path separators".to_string());
+    }
+    if trimmed.contains(':') {
+        return Err("Filename cannot contain colon".to_string());
+    }
+    if trimmed == "." || trimmed == ".." || trimmed.contains("..") {
+        return Err("Filename cannot contain directory traversal '..'".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
 pub async fn send_message(Json(input): Json<SendParams>) -> Json<SendResult> {
     if input.text.is_none() && input.image.is_none() && input.file.is_none() {
         return Json(SendResult {
@@ -454,39 +474,38 @@ pub async fn send_message(Json(input): Json<SendParams>) -> Json<SendResult> {
         }
     }
 
-    // Decode base64 file to temp file
+    // Decode base64 file to temp file with original basename preserved
     let mut file_path: Option<String> = None;
+    let mut temp_send_dir: Option<std::path::PathBuf> = None;
     if let Some(ref f) = input.file {
-        // Sanitize filename: keep ASCII alphanumerics, dot, hyphen, underscore;
-        // replace everything else (including CJK) with underscore so the temp
-        // path stays portable across locales.  The dot is preserved so that
-        // file extensions survive (e.g. "遗憾.pdf" → "__.pdf"); the mangled
-        // stem is acceptable since this is a transient temp path.
-        let safe_name: String = f
-            .filename
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        let path = format!(
-            "/tmp/send_file_{}_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis(),
-            safe_name
-        );
+        let safe_name = match sanitize_send_filename(&f.filename) {
+            Ok(s) => s,
+            Err(e) => {
+                return Json(SendResult {
+                    success: false,
+                    error: Some(format!("Invalid filename: {e}")),
+                });
+            }
+        };
+
+        let send_uuid = uuid::Uuid::new_v4().to_string();
+        let send_dir = std::path::PathBuf::from(format!("/tmp/agent-wechat-send/{send_uuid}"));
+        if let Err(e) = std::fs::create_dir_all(&send_dir) {
+            return Json(SendResult {
+                success: false,
+                error: Some(format!("Failed to create temp send dir: {e}")),
+            });
+        }
+
+        let full_path = send_dir.join(&safe_name);
         match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &f.data) {
-            Ok(bytes) => match std::fs::write(&path, &bytes) {
+            Ok(bytes) => match std::fs::write(&full_path, &bytes) {
                 Ok(_) => {
-                    file_path = Some(path);
+                    file_path = Some(full_path.to_string_lossy().to_string());
+                    temp_send_dir = Some(send_dir);
                 }
                 Err(e) => {
+                    let _ = std::fs::remove_dir_all(&send_dir);
                     return Json(SendResult {
                         success: false,
                         error: Some(format!("Failed to write temp file: {e}")),
@@ -494,6 +513,7 @@ pub async fn send_message(Json(input): Json<SendParams>) -> Json<SendResult> {
                 }
             },
             Err(e) => {
+                let _ = std::fs::remove_dir_all(&send_dir);
                 return Json(SendResult {
                     success: false,
                     error: Some(format!("Failed to decode base64 file data: {e}")),
@@ -527,6 +547,9 @@ pub async fn send_message(Json(input): Json<SendParams>) -> Json<SendResult> {
     }
     if let Some(p) = &file_path {
         let _ = std::fs::remove_file(p);
+    }
+    if let Some(dir) = &temp_send_dir {
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     Json(SendResult {
@@ -811,5 +834,52 @@ mod tests {
             1,
             "concurrent voice requests must extract exactly once"
         );
+    }
+
+    #[test]
+    fn test_ascii_unicode_filename_preservation() {
+        assert_eq!(sanitize_send_filename("test.pdf").unwrap(), "test.pdf");
+        assert_eq!(
+            sanitize_send_filename("实验报告.pdf").unwrap(),
+            "实验报告.pdf"
+        );
+        assert_eq!(
+            sanitize_send_filename("2026年 财务 (Q3) [final].xlsx").unwrap(),
+            "2026年 财务 (Q3) [final].xlsx"
+        );
+        assert_eq!(
+            sanitize_send_filename("🎉 emoji-file.txt").unwrap(),
+            "🎉 emoji-file.txt"
+        );
+    }
+
+    #[test]
+    fn test_traversal_rejection() {
+        assert!(sanitize_send_filename("../test.pdf").is_err());
+        assert!(sanitize_send_filename("..\\test.pdf").is_err());
+        assert!(sanitize_send_filename("/etc/passwd").is_err());
+        assert!(sanitize_send_filename("C:\\Windows\\win.ini").is_err());
+        assert!(sanitize_send_filename("foo/bar").is_err());
+        assert!(sanitize_send_filename("foo\\bar").is_err());
+        assert!(sanitize_send_filename("..").is_err());
+        assert!(sanitize_send_filename(".").is_err());
+        assert!(sanitize_send_filename("").is_err());
+        assert!(sanitize_send_filename("   ").is_err());
+        assert!(sanitize_send_filename("test\0bad.pdf").is_err());
+        assert!(sanitize_send_filename("test\nbad.pdf").is_err());
+    }
+
+    #[test]
+    fn test_temp_cleanup_success_and_failure() {
+        let send_uuid = uuid::Uuid::new_v4().to_string();
+        let send_dir = std::path::PathBuf::from(format!("/tmp/agent-wechat-send-test/{send_uuid}"));
+        std::fs::create_dir_all(&send_dir).unwrap();
+        let file_path = send_dir.join("test.pdf");
+        std::fs::write(&file_path, b"test").unwrap();
+        assert!(file_path.exists());
+
+        // Simulate cleanup
+        let _ = std::fs::remove_dir_all(&send_dir);
+        assert!(!send_dir.exists());
     }
 }
