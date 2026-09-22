@@ -17,6 +17,11 @@ if [ ! -f "$FILE" ]; then
   exit 1
 fi
 
+# Delegate GIF to paste-file so Qt/Chromium uses text/uri-list (WeChat native animated sticker TYPE: 47)
+if [ "${MIME:-}" = "image/gif" ] || [[ "${FILE,,}" == *.gif ]]; then
+  exec /opt/tools/paste-file "$FILE"
+fi
+
 # Copy image to clipboard (backgrounded — xclip blocks until
 # the selection is consumed, so it must run in parallel with the paste)
 xclip -selection clipboard -t "$MIME" -i < "$FILE" >/dev/null 2>&1 &
