@@ -50,6 +50,7 @@ jobs:
           sbom: false
           tags: |
             ${{ env.IMAGE }}:main
+            ${{ env.IMAGE }}:latest
             ${{ env.IMAGE }}:sha-${{ github.sha }}
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
