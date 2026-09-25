@@ -175,7 +175,6 @@ pub fn get_db_path(account_dir: &str, db_name: &str) -> String {
         ("contact.db", "contact"),
         ("contact_fts.db", "contact"),
         ("session.db", "session"),
-        ("message_0.db", "message"),
         ("message_fts.db", "message"),
         ("message_resource.db", "message"),
         ("biz_message_0.db", "message"),
@@ -190,11 +189,19 @@ pub fn get_db_path(account_dir: &str, db_name: &str) -> String {
         ("bizchat.db", "bizchat"),
     ];
 
-    let sub_dir = sub_dir_map
-        .iter()
-        .find(|(name, _)| *name == db_name)
-        .map(|(_, dir)| *dir)
-        .unwrap_or_else(|| db_name.strip_suffix(".db").unwrap_or(db_name));
+    let numbered_message_db = db_name
+        .strip_prefix("message_")
+        .and_then(|suffix| suffix.strip_suffix(".db"))
+        .is_some_and(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()));
+    let sub_dir = if numbered_message_db {
+        "message"
+    } else {
+        sub_dir_map
+            .iter()
+            .find(|(name, _)| *name == db_name)
+            .map(|(_, dir)| *dir)
+            .unwrap_or_else(|| db_name.strip_suffix(".db").unwrap_or(db_name))
+    };
 
     if account_dir.starts_with('/') {
         let direct_path = Path::new(account_dir)
@@ -232,9 +239,22 @@ pub fn get_db_path(account_dir: &str, db_name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::get_db_path;
     use rusqlite::{Connection, OpenFlags};
     use std::sync::{Arc, Barrier};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn numbered_message_databases_share_message_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let account_dir = dir.path().to_str().unwrap();
+        for name in ["message_0.db", "message_1.db", "message_12.db"] {
+            let expected = dir.path().join("db_storage").join("message").join(name);
+            std::fs::create_dir_all(expected.parent().unwrap()).unwrap();
+            std::fs::write(&expected, []).unwrap();
+            assert_eq!(get_db_path(account_dir, name), expected.to_string_lossy());
+        }
+    }
 
     /// Create a temp DB that simulates WeChat's encrypted DB pattern.
     /// Uses plaintext SQLite (no encryption) since we're testing lock behavior,

@@ -1,0 +1,64 @@
+name: Publish WeChat Hub main image
+
+on:
+  push:
+    branches: [wechat-hub-main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/onestao/wechat-hub-agent-wechat
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Verify migration bytes
+        run: |
+          test "$(sha256sum packages/agent-server-rust/migrations/V1__baseline.sql | cut -d' ' -f1)" = "65d7869886f7e71e78f2c656fb3310583355233ea6f1c3db00fa52dae4667c81"
+          test "$(sha256sum packages/agent-server-rust/migrations/V2__add_novnc_port.sql | cut -d' ' -f1)" = "d09de45789d5b4cded420ab4a69b47c4f4aae9ddde740734a4a2ccee3a833c41"
+      - name: Test
+        run: |
+          cargo fmt --check --manifest-path packages/agent-server-rust/Cargo.toml
+          cargo test --locked --manifest-path packages/agent-server-rust/Cargo.toml
+      - name: Verify pinned runtime
+        run: scripts/ci/verify-pinned-runtime.sh
+      - name: Prepare build context
+        run: scripts/ci/prepare-docker-context.sh
+
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: docker
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          sbom: false
+          tags: |
+            ${{ env.IMAGE }}:main
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/onestao/agent-wechat
+            org.opencontainers.image.version=main
+          cache-from: type=gha,scope=wechat-hub-main-amd64
+          cache-to: type=gha,scope=wechat-hub-main-amd64,mode=max
+      - name: Summary
+        run: |
+          echo "### AgentWechat" >> "$GITHUB_STEP_SUMMARY"
+          echo "Digest: \`${{ steps.build.outputs.digest }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Platform: \`linux/amd64\` (current verified WeChat substrate)" >> "$GITHUB_STEP_SUMMARY"
