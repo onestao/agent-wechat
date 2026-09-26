@@ -953,8 +953,9 @@ pub fn get_message_media(
     let sub = (local_type >> 32) as i32;
 
     match base {
-        49 if sub == 6 => {
-            // File attachment (appmsg subtype 6)
+        49 if sub == 6 || sub == 74 || content.contains("<type>74</type>") => {
+            // File attachment (appmsg subtype 6), or a file still uploading
+            // (74): get_file_attachment reports pending until it is on disk.
             return get_file_attachment(account_dir, &content, create_time, local_id);
         }
         3 => {

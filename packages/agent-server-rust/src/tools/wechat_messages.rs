@@ -444,9 +444,13 @@ pub(crate) fn classify_message(
                     },
                     None,
                 )
-            } else if appmsg_type == 6 {
+            } else if appmsg_type == 6 || appmsg_type == 74 {
+                // 74 = file still uploading: WeChat later rewrites the same
+                // row as 6. Classify it as a file up front, because consumers
+                // do not re-read rows they already synced; its media reports
+                // pending until the file is on disk.
                 let fname = extract_xml_tag(body, "title");
-                (Some("file".to_string()), Some(6), fname)
+                (Some("file".to_string()), Some(appmsg_type), fname)
             } else if appmsg_type == 5 || appmsg_type == 3 || appmsg_type == 4 {
                 (Some("link".to_string()), Some(appmsg_type), None)
             } else {
@@ -542,6 +546,17 @@ mod tests {
         assert_eq!(kind, Some("reply".to_string()));
         assert_eq!(subtype, Some(57));
         assert_eq!(filename, None);
+    }
+
+    #[test]
+    fn test_type49_file_uploading_is_file() {
+        // WeChat first stores a sent file as appmsg type 74 (uploading) and
+        // later rewrites the same row as type 6.
+        let xml = r#"<msg><appmsg><title>IMG_2402.JPG</title><type>74</type><appattach><fileext>JPG</fileext></appattach></appmsg></msg>"#;
+        let (kind, subtype, filename) = classify_message(xml, 49, &None);
+        assert_eq!(kind, Some("file".to_string()));
+        assert_eq!(subtype, Some(74));
+        assert_eq!(filename, Some("IMG_2402.JPG".to_string()));
     }
 
     #[test]
