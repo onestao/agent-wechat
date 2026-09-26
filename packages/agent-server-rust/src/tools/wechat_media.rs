@@ -1,9 +1,11 @@
 use crate::ia::types::MediaResult;
 use crate::tools::wechat_db::{get_db_path, query_wechat_db};
+use crate::tools::wechat_live_db::query_hot_wechat_db;
 use crate::tools::wechat_messages::{
     decode_message_content, extract_xml_tag, find_message_db, get_msg_table_name,
 };
 use md5::{Digest, Md5};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -48,6 +50,24 @@ fn account_base_paths(account_dir: &str) -> [String; 2] {
     ]
 }
 
+/// Query a WeChat DB so that rows still held in its live WAL are visible.
+///
+/// `query_wechat_db` opens the main file with `immutable=1`, which ignores the
+/// WAL: messages, voice data and resource rows written moments ago are not
+/// visible until WeChat checkpoints. `list_messages` already reads through the
+/// private hot snapshot, so media lookups must do the same or a message that
+/// was just listed cannot be found. Falls back to the immutable read if the
+/// snapshot cannot be refreshed.
+fn query_fresh_wechat_db(account_dir: &str, db_name: &str, key: &str, sql: &str) -> Vec<Value> {
+    match query_hot_wechat_db(account_dir, db_name, key, sql) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("[media] hot query for {db_name} failed, using main file: {e}");
+            query_wechat_db(&get_db_path(account_dir, db_name), key, sql)
+        }
+    }
+}
+
 /// Look up a single message's raw content by localId.
 pub(crate) fn lookup_message_raw(
     account_dir: &str,
@@ -57,10 +77,10 @@ pub(crate) fn lookup_message_raw(
 ) -> Option<(i64, i64, String)> {
     let table_name = get_msg_table_name(chat_id);
     let (db_name, key) = find_message_db(account_dir, keys, chat_id)?;
-    let db_path = get_db_path(account_dir, &db_name);
 
-    let rows = query_wechat_db(
-        &db_path,
+    let rows = query_fresh_wechat_db(
+        account_dir,
+        &db_name,
         key,
         &format!(
             "SELECT local_type, create_time,
@@ -453,11 +473,11 @@ fn find_file_hash_via_resource_db(
     local_id: i64,
 ) -> Option<String> {
     let resource_key = keys.get("message_resource.db")?;
-    let resource_db = get_db_path(account_dir, "message_resource.db");
 
     // Look up chat_id integer from ChatName2Id
-    let chat_rows = query_wechat_db(
-        &resource_db,
+    let chat_rows = query_fresh_wechat_db(
+        account_dir,
+        "message_resource.db",
         resource_key,
         &format!(
             "SELECT rowid FROM ChatName2Id WHERE user_name = '{}' LIMIT 1;",
@@ -467,8 +487,9 @@ fn find_file_hash_via_resource_db(
     let chat_id_int = chat_rows.first()?.get("rowid")?.as_i64()?;
 
     // Query packed_info from MessageResourceInfo
-    let info_rows = query_wechat_db(
-        &resource_db,
+    let info_rows = query_fresh_wechat_db(
+        account_dir,
+        "message_resource.db",
         resource_key,
         &format!(
             "SELECT hex(packed_info) as hex_info FROM MessageResourceInfo
@@ -818,10 +839,9 @@ fn get_voice_data(
     media_dbs.sort_by_key(|(k, _)| k.to_string());
 
     for (db_name, media_key) in &media_dbs {
-        let media_db = get_db_path(account_dir, db_name);
-
-        let name_rows = query_wechat_db(
-            &media_db,
+        let name_rows = query_fresh_wechat_db(
+            account_dir,
+            db_name,
             media_key,
             &format!(
                 "SELECT rowid FROM Name2Id WHERE user_name = '{}';",
@@ -833,8 +853,9 @@ fn get_voice_data(
             None => continue,
         };
 
-        let voice_rows = query_wechat_db(
-            &media_db,
+        let voice_rows = query_fresh_wechat_db(
+            account_dir,
+            db_name,
             media_key,
             &format!(
                 "SELECT hex(voice_data) as hex_data FROM VoiceInfo
@@ -940,12 +961,14 @@ pub fn get_message_media(
         match lookup_message_raw(account_dir, keys, chat_id, local_id) {
             Some(t) => t,
             None => {
+                // Not visible yet (e.g. not yet readable from the DB). Report
+                // pending so callers retry instead of caching "unsupported".
                 tracing::warn!(
                     "[media] lookup_message_raw returned None for chat_id={}, local_id={}",
                     chat_id,
                     local_id
                 );
-                return unsupported();
+                return pending();
             }
         };
 
@@ -1101,5 +1124,69 @@ mod tests {
             file_path: None,
         };
         assert_eq!(orig_res.role, Some("original".to_string()));
+    }
+
+    /// A message WeChat has just written sits in the live WAL until the next
+    /// checkpoint. `list_messages` sees it through the hot snapshot, so the
+    /// media lookup for the same message must see it too.
+    #[test]
+    fn test_lookup_message_raw_sees_uncheckpointed_wal_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let account_dir = tmp.path().to_str().unwrap();
+        let msg_dir = tmp.path().join("db_storage").join("message");
+        std::fs::create_dir_all(&msg_dir).unwrap();
+        // Unique numbered DB name keeps this test's snapshot cache separate.
+        let db_name = "message_7.db";
+        let db_path = msg_dir.join(db_name);
+
+        let chat_id = "wal_test_chat";
+        let table_name = get_msg_table_name(chat_id);
+        let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+        // Writer stays open with auto-checkpoint disabled, like WeChat between
+        // checkpoints: the chat table is checkpointed into the main file (as
+        // for any existing chat) but the new voice message (type 34) exists
+        // only in the WAL.
+        let writer = rusqlite::Connection::open(&db_path).unwrap();
+        writer
+            .execute_batch(&format!(
+                "PRAGMA key = \"x'{key}'\";
+                 PRAGMA cipher_compatibility = 4;
+                 PRAGMA journal_mode = WAL;
+                 PRAGMA wal_autocheckpoint = 0;
+                 CREATE TABLE \"{table_name}\" (
+                     local_id INTEGER PRIMARY KEY,
+                     local_type INTEGER,
+                     create_time INTEGER,
+                     message_content BLOB,
+                     WCDB_CT_message_content INTEGER
+                 );
+                 PRAGMA wal_checkpoint(TRUNCATE);
+                 INSERT INTO \"{table_name}\" VALUES (1, 34, 1790000000, CAST('voice' AS BLOB), 0);"
+            ))
+            .unwrap();
+        assert!(msg_dir.join(format!("{db_name}-wal")).exists());
+
+        let mut keys = HashMap::new();
+        keys.insert(db_name.to_string(), key.to_string());
+
+        // The immutable main-file read cannot see the WAL-only row.
+        let cold = query_wechat_db(
+            &get_db_path(account_dir, db_name),
+            key,
+            &format!("SELECT local_id FROM \"{table_name}\" WHERE local_id = 1;"),
+        );
+        assert!(cold.is_empty(), "immutable read unexpectedly saw WAL row");
+
+        std::env::set_var(
+            "WECHAT_LIVE_DB_CACHE_DIR",
+            tmp.path().join("cache").to_str().unwrap(),
+        );
+        let found = lookup_message_raw(account_dir, &keys, chat_id, 1);
+        let (local_type, create_time, _) = found.expect("WAL-only message must be found");
+        assert_eq!(local_type, 34);
+        assert_eq!(create_time, 1790000000);
+
+        drop(writer);
     }
 }

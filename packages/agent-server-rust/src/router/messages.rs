@@ -166,21 +166,28 @@ pub async fn get_media(
     };
 
     // 1. Determine message type FIRST from message DB.
+    // A message that cannot be found yet (e.g. just written by WeChat) is
+    // reported as pending, not unsupported: callers cache "unsupported" and
+    // would never retry.
     let (local_type, _create_time, _content) =
         match lookup_message_raw(&logged_in_user, &keys, &chat_id, local_id) {
             Some(t) => t,
             None => {
+                tracing::warn!(
+                    "[media] message not found yet for chat_id={}, local_id={}; reporting pending",
+                    chat_id,
+                    local_id
+                );
                 return if params.raw {
-                    let mut resp =
-                        (axum::http::StatusCode::NOT_FOUND, "unsupported").into_response();
+                    let mut resp = (axum::http::StatusCode::ACCEPTED, "pending").into_response();
                     resp.headers_mut().insert(
                         "x-media-status",
-                        axum::http::HeaderValue::from_static("unsupported"),
+                        axum::http::HeaderValue::from_static("pending"),
                     );
                     resp
                 } else {
                     Json(MediaResult {
-                        media_type: "unsupported".to_string(),
+                        media_type: "pending".to_string(),
                         data: None,
                         url: None,
                         format: String::new(),
