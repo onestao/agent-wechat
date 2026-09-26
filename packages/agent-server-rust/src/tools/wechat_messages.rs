@@ -101,8 +101,45 @@ pub(crate) fn clean_content(content: &str, msg_type: i32) -> String {
                 }
             }
         }
+        // VoIP call record (type 50): replace call XML with a short summary
+        50 => summarize_voip_call(content).unwrap_or_else(|| content.to_string()),
         _ => content.to_string(),
     }
+}
+
+/// Summarize a type 50 (VoIP) call record as short text.
+///
+/// Private (1:1) calls are stored as XML, unlike group calls which arrive as
+/// plain type 10000 system text. Two shapes are observed:
+/// - `<voipmsg type="VoIPBubbleMsg">` – the call bubble; `<msg>` holds the
+///   localized status shown in WeChat (e.g. "已取消", "通话时长 00:12").
+/// - `<voipinvitemsg>` – an incoming call invitation, usually without text.
+///
+/// `room_type` / `invite_type` of 1 has been observed for voice calls; other
+/// values are reported as a generic call rather than guessed.
+fn summarize_voip_call(content: &str) -> Option<String> {
+    let label = |media: Option<String>| match media.as_deref() {
+        Some("1") => "Voice call",
+        _ => "Call",
+    };
+    if content.contains("<VoIPBubbleMsg>") {
+        let label = label(extract_xml_tag(content, "room_type"));
+        return Some(match extract_xml_tag(content, "msg") {
+            Some(status) => format!("[{label}] {status}"),
+            None => format!("[{label}]"),
+        });
+    }
+    if content.contains("<voipinvitemsg>") {
+        let label = label(extract_xml_tag(content, "invite_type"));
+        return Some(match extract_xml_tag(content, "display_content") {
+            Some(text) => format!("[{label}] {text}"),
+            None => format!("[{label}] Incoming"),
+        });
+    }
+    if content.contains("<voip") {
+        return Some("[Call]".to_string());
+    }
+    None
 }
 
 /// Extract reply info from type 49 (appmsg) messages with <refermsg>.
@@ -425,7 +462,9 @@ pub(crate) fn classify_message(
         34 => (Some("voice".to_string()), None, None),
         43 => (Some("video".to_string()), None, None),
         47 => (Some("sticker".to_string()), None, None),
-        10000 | 10002 => (Some("system".to_string()), None, None),
+        // VoIP call records (type 50) are call status notices, like group
+        // call notices which already arrive as type 10000 system messages.
+        10000 | 10002 | 50 => (Some("system".to_string()), None, None),
         49 => {
             let appmsg_type = if body.contains("<msg>") {
                 extract_xml_tag(body, "type")
@@ -558,6 +597,58 @@ mod tests {
         assert_eq!(kind2, Some("unknown".to_string()));
         assert_eq!(subtype2, None);
         assert_eq!(filename2, None);
+    }
+
+    #[test]
+    fn test_type50_voip_bubble_outgoing_cancelled() {
+        // Private call placed by the account owner and cancelled (IDs replaced).
+        let xml = r#"<voipmsg type="VoIPBubbleMsg"><VoIPBubbleMsg><msg><![CDATA[已取消]]></msg>
+<room_type>1</room_type>
+<red_dot>false</red_dot>
+<roomid>100000000000000001</roomid>
+<roomkey>0</roomkey>
+<inviteid>1000000001</inviteid>
+<msg_type>100</msg_type>
+<timestamp>1790436203922</timestamp>
+<identity><![CDATA[1000000000000000001]]></identity>
+<duration>0</duration>
+<inviteid64>1790436199151</inviteid64>
+<business>1</business>
+<caller_memberid>0</caller_memberid>
+<callee_memberid>1</callee_memberid>
+<force_update>0</force_update>
+</VoIPBubbleMsg></voipmsg>"#;
+        assert_eq!(clean_content(xml, 50), "[Voice call] 已取消");
+        let (kind, subtype, filename) = classify_message(xml, 50, &None);
+        assert_eq!(kind, Some("system".to_string()));
+        assert_eq!(subtype, None);
+        assert_eq!(filename, None);
+    }
+
+    #[test]
+    fn test_type50_voip_invite_incoming() {
+        // Private call received from a contact.
+        let xml = r#"<voipinvitemsg><roomid>0</roomid><key>0</key><status>0</status><invite_type>1</invite_type></voipinvitemsg><voipextinfo><recvtime>0</recvtime></voipextinfo><voiplocalinfo><wording_type>4609</wording_type><duration>0</duration><display_content></display_content></voiplocalinfo>"#;
+        assert_eq!(clean_content(xml, 50), "[Voice call] Incoming");
+        let (kind, _, _) = classify_message(xml, 50, &None);
+        assert_eq!(kind, Some("system".to_string()));
+    }
+
+    #[test]
+    fn test_type50_voip_fallbacks() {
+        // Unrecognized media type is reported as a generic call, not guessed.
+        let bubble = r#"<voipmsg type="VoIPBubbleMsg"><VoIPBubbleMsg><msg><![CDATA[通话时长 00:12]]></msg><room_type>7</room_type></VoIPBubbleMsg></voipmsg>"#;
+        assert_eq!(clean_content(bubble, 50), "[Call] 通话时长 00:12");
+        // Invitation that carries display text keeps it.
+        let invite = r#"<voipinvitemsg><invite_type>1</invite_type></voipinvitemsg><voiplocalinfo><display_content>对方已拒绝</display_content></voiplocalinfo>"#;
+        assert_eq!(clean_content(invite, 50), "[Voice call] 对方已拒绝");
+        // Other VoIP XML never leaks raw markup.
+        assert_eq!(
+            clean_content("<voipnotifymsg><x>1</x></voipnotifymsg>", 50),
+            "[Call]"
+        );
+        // Non-XML content is left untouched.
+        assert_eq!(clean_content("plain", 50), "plain");
     }
 
     #[test]
