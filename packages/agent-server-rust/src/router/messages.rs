@@ -11,11 +11,16 @@ use crate::context::create_context;
 use crate::db::get_db;
 use crate::execution::run_execution_loop;
 use crate::ia::types::{MediaResult, Message, SendResult, SubscriptionEvent};
+use crate::plans::chat_open::{ChatOpenParams, ChatOpenPlan};
 use crate::plans::send_message::{SendMessageParams, SendMessagePlan};
+use crate::plans::video_download::{BubbleKind, VideoDownloadParams, VideoDownloadPlan};
 use crate::sessions::manager::get_session;
 use crate::tools::wechat_db::{find_wechat_pid, list_account_dbs};
 use crate::tools::wechat_keys::{extract_keys_async, get_image_keys, get_stored_keys, store_keys};
-use crate::tools::wechat_media::{get_message_media, lookup_message_raw};
+use crate::tools::wechat_media::{
+    get_message_media, image_has_only_thumbnail, image_missing_original, lookup_message_raw,
+    video_missing_original, video_play_length,
+};
 use crate::tools::wechat_messages;
 
 #[derive(Deserialize)]
@@ -107,6 +112,221 @@ pub struct MediaParams {
     pub raw: bool,
 }
 
+/// Only media received within this window trigger UI actions.
+const MEDIA_DOWNLOAD_RECENT_SECS: i64 = 24 * 60 * 60;
+/// How long to report pending after triggering a download.
+const MEDIA_DOWNLOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// After an image job finished, how long to keep waiting for its file.
+/// Non-original images never get an `_h.dat`, so waiting for the full
+/// window would only delay them; the chat-size copy is used instead.
+const IMAGE_DONE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A triggered download: when it started and, once the UI job has run,
+/// when it finished.
+#[derive(Clone, Copy)]
+struct DownloadTrigger {
+    started: std::time::Instant,
+    finished: Option<std::time::Instant>,
+}
+
+/// Triggered downloads, keyed by "chat_id:local_id:job".
+static MEDIA_DOWNLOAD_TRIGGERS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, DownloadTrigger>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn mark_download_finished(key: &str) {
+    if let Some(t) = MEDIA_DOWNLOAD_TRIGGERS.lock().unwrap().get_mut(key) {
+        t.finished = Some(std::time::Instant::now());
+    }
+}
+
+/// Marks a download job finished when the background task ends, including
+/// on failure or panic.
+struct FinishOnDrop(String);
+
+impl Drop for FinishOnDrop {
+    fn drop(&mut self) {
+        mark_download_finished(&self.0);
+    }
+}
+
+/// UI action that makes WeChat download a message's media.
+enum MediaDownloadJob {
+    /// Showing the chat downloads the chat-size image.
+    OpenChat,
+    /// Clicking the bubble downloads the video / original image.
+    ClickBubble { kind: BubbleKind, is_self: bool },
+}
+
+/// Opt-in: also fetch original images (`_h.dat`) by opening them in the
+/// viewer. Off by default because it adds a UI action per image.
+fn image_original_enabled() -> bool {
+    matches!(
+        std::env::var("AGENT_WECHAT_IMAGE_ORIGINAL")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Decide whether to keep waiting for media WeChat has not downloaded yet.
+///
+/// On the first request for recent media, runs `job` in the background and
+/// returns true. Returns true while the wait window lasts, then false so the
+/// caller falls back to whatever is on disk. Old media never trigger UI
+/// actions.
+fn media_download_should_wait(
+    chat_id: &str,
+    local_id: i64,
+    create_time: i64,
+    job: MediaDownloadJob,
+) -> bool {
+    let age = chrono::Utc::now().timestamp() - create_time;
+    if !(0..=MEDIA_DOWNLOAD_RECENT_SECS).contains(&age) {
+        return false;
+    }
+    let tag = match &job {
+        MediaDownloadJob::OpenChat => "open",
+        MediaDownloadJob::ClickBubble { .. } => "click",
+    };
+    // Videos keep downloading after the click, so they wait the full window;
+    // images are on disk right after the UI job, so stop shortly after it.
+    let is_image = !matches!(
+        job,
+        MediaDownloadJob::ClickBubble {
+            kind: BubbleKind::Video { .. },
+            ..
+        }
+    );
+    let key = format!("{chat_id}:{local_id}:{tag}");
+    let now = std::time::Instant::now();
+    {
+        let mut triggers = MEDIA_DOWNLOAD_TRIGGERS.lock().unwrap();
+        triggers.retain(|_, t| now.duration_since(t.started) < MEDIA_DOWNLOAD_WAIT * 4);
+        if let Some(t) = triggers.get(&key) {
+            if is_image {
+                if let Some(finished) = t.finished {
+                    return now.duration_since(finished) < IMAGE_DONE_GRACE;
+                }
+            }
+            return now.duration_since(t.started) < MEDIA_DOWNLOAD_WAIT;
+        }
+        triggers.insert(
+            key.clone(),
+            DownloadTrigger {
+                started: now,
+                finished: None,
+            },
+        );
+    }
+    let chat_id = chat_id.to_string();
+    tokio::spawn(async move {
+        let _finish = FinishOnDrop(key);
+        match job {
+            MediaDownloadJob::OpenChat => {
+                tracing::info!(
+                    "[media] opening chat {chat_id} to download image local_id={local_id}"
+                );
+                open_chat_for_media(chat_id).await;
+            }
+            MediaDownloadJob::ClickBubble { kind, is_self } => {
+                tracing::info!(
+                    "[media] clicking {kind:?} in {chat_id} to download local_id={local_id}"
+                );
+                click_bubble_for_media(chat_id, kind, is_self).await;
+            }
+        }
+    });
+    true
+}
+
+/// Open the chat and click the media bubble so WeChat downloads the video or
+/// original image.
+async fn click_bubble_for_media(chat_id: String, kind: BubbleKind, is_self: bool) {
+    let Some(session) = get_session("default") else {
+        return;
+    };
+    if session.logged_in_user.is_none() {
+        return;
+    }
+    let mut context = {
+        let db = get_db();
+        create_context(session, &db)
+    };
+    let params = VideoDownloadParams {
+        chat_id: chat_id.clone(),
+        kind,
+        is_self,
+    };
+    let noop_emit = |_: SubscriptionEvent| {};
+    let (result, _) = run_execution_loop(
+        &VideoDownloadPlan,
+        &params,
+        &mut context,
+        &noop_emit,
+        CancellationToken::new(),
+    )
+    .await;
+    if !result.success {
+        tracing::warn!(
+            "[media] media download click failed for {chat_id}: {}",
+            result.error.unwrap_or_default()
+        );
+    }
+}
+
+/// Whether a message was sent by the logged-in account (decides which side
+/// of the chat its bubble is on).
+fn message_is_self(
+    account_dir: &str,
+    keys: &std::collections::HashMap<String, String>,
+    chat_id: &str,
+    local_id: i64,
+) -> bool {
+    wechat_messages::list_messages(account_dir, keys, chat_id, 50, 0)
+        .ok()
+        .and_then(|msgs| msgs.into_iter().find(|m| m.local_id == local_id))
+        .and_then(|m| m.is_self)
+        .unwrap_or(false)
+}
+
+/// Open a chat in the WeChat UI without clearing unreads. Plans are
+/// serialized by the execution loop, so this does not race with sends.
+async fn open_chat_for_media(chat_id: String) {
+    let Some(session) = get_session("default") else {
+        return;
+    };
+    if session.logged_in_user.is_none() {
+        return;
+    }
+    let mut context = {
+        let db = get_db();
+        create_context(session, &db)
+    };
+    let params = ChatOpenParams {
+        chat_id: chat_id.clone(),
+        clear_unreads: false,
+    };
+    let noop_emit = |_: SubscriptionEvent| {};
+    let (result, _) = run_execution_loop(
+        &ChatOpenPlan,
+        &params,
+        &mut context,
+        &noop_emit,
+        CancellationToken::new(),
+    )
+    .await;
+    if !result.success {
+        tracing::warn!(
+            "[media] chat open for image download failed for {chat_id}: {}",
+            result.error.unwrap_or_default()
+        );
+    }
+}
+
 pub async fn get_media(
     Path((chat_id, local_id)): Path<(String, i64)>,
     Query(params): Query<MediaParams>,
@@ -166,21 +386,28 @@ pub async fn get_media(
     };
 
     // 1. Determine message type FIRST from message DB.
-    let (local_type, _create_time, _content) =
+    // A message that cannot be found yet (e.g. just written by WeChat) is
+    // reported as pending, not unsupported: callers cache "unsupported" and
+    // would never retry.
+    let (local_type, create_time, content) =
         match lookup_message_raw(&logged_in_user, &keys, &chat_id, local_id) {
             Some(t) => t,
             None => {
+                tracing::warn!(
+                    "[media] message not found yet for chat_id={}, local_id={}; reporting pending",
+                    chat_id,
+                    local_id
+                );
                 return if params.raw {
-                    let mut resp =
-                        (axum::http::StatusCode::NOT_FOUND, "unsupported").into_response();
+                    let mut resp = (axum::http::StatusCode::ACCEPTED, "pending").into_response();
                     resp.headers_mut().insert(
                         "x-media-status",
-                        axum::http::HeaderValue::from_static("unsupported"),
+                        axum::http::HeaderValue::from_static("pending"),
                     );
                     resp
                 } else {
                     Json(MediaResult {
-                        media_type: "unsupported".to_string(),
+                        media_type: "pending".to_string(),
                         data: None,
                         url: None,
                         format: String::new(),
@@ -230,6 +457,60 @@ pub async fn get_media(
     )
     .await
     {
+        return if params.raw {
+            let mut resp = (axum::http::StatusCode::ACCEPTED, "pending").into_response();
+            resp.headers_mut().insert(
+                "x-media-status",
+                axum::http::HeaderValue::from_static("pending"),
+            );
+            resp
+        } else {
+            Json(MediaResult {
+                media_type: "pending".to_string(),
+                data: None,
+                url: None,
+                format: String::new(),
+                filename: String::new(),
+                role: None,
+                file_path: None,
+            })
+            .into_response()
+        };
+    }
+
+    // 3. The Linux client keeps only thumbnails until media is viewed:
+    // images download once shown in the chat view, videos once their bubble
+    // is clicked. For recent media missing its original, run that UI action
+    // once in the background and report pending for a short window;
+    // afterwards fall back to what is on disk rather than waiting forever.
+    // With AGENT_WECHAT_IMAGE_ORIGINAL enabled, images are opened in the
+    // viewer to fetch the original (`_h.dat`) instead of the chat-size copy.
+    let download_job = match base_type {
+        3 if image_original_enabled()
+            && image_missing_original(&logged_in_user, &keys, &chat_id, local_id, create_time) =>
+        {
+            Some(MediaDownloadJob::ClickBubble {
+                kind: BubbleKind::Image,
+                is_self: message_is_self(&logged_in_user, &keys, &chat_id, local_id),
+            })
+        }
+        3 if image_has_only_thumbnail(&logged_in_user, &keys, &chat_id, local_id, create_time) => {
+            Some(MediaDownloadJob::OpenChat)
+        }
+        43 if video_missing_original(&logged_in_user, &keys, &chat_id, local_id, create_time) => {
+            Some(MediaDownloadJob::ClickBubble {
+                kind: BubbleKind::Video {
+                    duration_secs: video_play_length(&content),
+                },
+                is_self: message_is_self(&logged_in_user, &keys, &chat_id, local_id),
+            })
+        }
+        _ => None,
+    };
+    let should_wait = download_job
+        .map(|job| media_download_should_wait(&chat_id, local_id, create_time, job))
+        .unwrap_or(false);
+    if should_wait {
         return if params.raw {
             let mut resp = (axum::http::StatusCode::ACCEPTED, "pending").into_response();
             resp.headers_mut().insert(
@@ -901,5 +1182,79 @@ mod tests {
         // Simulate cleanup
         let _ = std::fs::remove_dir_all(&send_dir);
         assert!(!send_dir.exists());
+    }
+
+    #[test]
+    fn test_image_wait_ends_shortly_after_job_finishes() {
+        let now = chrono::Utc::now().timestamp();
+        let t0 = std::time::Instant::now() - std::time::Duration::from_secs(20);
+        {
+            let mut triggers = MEDIA_DOWNLOAD_TRIGGERS.lock().unwrap();
+            // Image click finished 10s ago: stop waiting (no _h.dat coming).
+            triggers.insert(
+                "grace_chat:1:click".to_string(),
+                DownloadTrigger {
+                    started: t0,
+                    finished: Some(std::time::Instant::now() - std::time::Duration::from_secs(10)),
+                },
+            );
+            // Image click still running: keep waiting.
+            triggers.insert(
+                "grace_chat:2:click".to_string(),
+                DownloadTrigger {
+                    started: t0,
+                    finished: None,
+                },
+            );
+            // Video click finished: keep waiting, the file may still download.
+            triggers.insert(
+                "grace_chat:3:click".to_string(),
+                DownloadTrigger {
+                    started: t0,
+                    finished: Some(std::time::Instant::now() - std::time::Duration::from_secs(10)),
+                },
+            );
+        }
+        let image = || MediaDownloadJob::ClickBubble {
+            kind: BubbleKind::Image,
+            is_self: false,
+        };
+        assert!(!media_download_should_wait("grace_chat", 1, now, image()));
+        assert!(media_download_should_wait("grace_chat", 2, now, image()));
+        assert!(media_download_should_wait(
+            "grace_chat",
+            3,
+            now,
+            MediaDownloadJob::ClickBubble {
+                kind: BubbleKind::Video {
+                    duration_secs: None
+                },
+                is_self: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_media_download_wait_skips_old_and_future_media() {
+        let now = chrono::Utc::now().timestamp();
+        // Older than the window: never opens a chat, never waits.
+        assert!(!media_download_should_wait(
+            "old_chat",
+            1,
+            now - MEDIA_DOWNLOAD_RECENT_SECS - 60,
+            MediaDownloadJob::OpenChat
+        ));
+        // Timestamp in the future (clock skew): treated as not recent.
+        assert!(!media_download_should_wait(
+            "future_chat",
+            1,
+            now + 3600,
+            MediaDownloadJob::OpenChat
+        ));
+        assert!(MEDIA_DOWNLOAD_TRIGGERS
+            .lock()
+            .unwrap()
+            .keys()
+            .all(|k| !k.starts_with("old_chat") && !k.starts_with("future_chat")));
     }
 }

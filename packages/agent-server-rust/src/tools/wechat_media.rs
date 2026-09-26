@@ -1,9 +1,11 @@
 use crate::ia::types::MediaResult;
 use crate::tools::wechat_db::{get_db_path, query_wechat_db};
+use crate::tools::wechat_live_db::query_hot_wechat_db;
 use crate::tools::wechat_messages::{
     decode_message_content, extract_xml_tag, find_message_db, get_msg_table_name,
 };
 use md5::{Digest, Md5};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -48,6 +50,24 @@ fn account_base_paths(account_dir: &str) -> [String; 2] {
     ]
 }
 
+/// Query a WeChat DB so that rows still held in its live WAL are visible.
+///
+/// `query_wechat_db` opens the main file with `immutable=1`, which ignores the
+/// WAL: messages, voice data and resource rows written moments ago are not
+/// visible until WeChat checkpoints. `list_messages` already reads through the
+/// private hot snapshot, so media lookups must do the same or a message that
+/// was just listed cannot be found. Falls back to the immutable read if the
+/// snapshot cannot be refreshed.
+fn query_fresh_wechat_db(account_dir: &str, db_name: &str, key: &str, sql: &str) -> Vec<Value> {
+    match query_hot_wechat_db(account_dir, db_name, key, sql) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("[media] hot query for {db_name} failed, using main file: {e}");
+            query_wechat_db(&get_db_path(account_dir, db_name), key, sql)
+        }
+    }
+}
+
 /// Look up a single message's raw content by localId.
 pub(crate) fn lookup_message_raw(
     account_dir: &str,
@@ -57,10 +77,10 @@ pub(crate) fn lookup_message_raw(
 ) -> Option<(i64, i64, String)> {
     let table_name = get_msg_table_name(chat_id);
     let (db_name, key) = find_message_db(account_dir, keys, chat_id)?;
-    let db_path = get_db_path(account_dir, &db_name);
 
-    let rows = query_wechat_db(
-        &db_path,
+    let rows = query_fresh_wechat_db(
+        account_dir,
+        &db_name,
         key,
         &format!(
             "SELECT local_type, create_time,
@@ -453,11 +473,11 @@ fn find_file_hash_via_resource_db(
     local_id: i64,
 ) -> Option<String> {
     let resource_key = keys.get("message_resource.db")?;
-    let resource_db = get_db_path(account_dir, "message_resource.db");
 
     // Look up chat_id integer from ChatName2Id
-    let chat_rows = query_wechat_db(
-        &resource_db,
+    let chat_rows = query_fresh_wechat_db(
+        account_dir,
+        "message_resource.db",
         resource_key,
         &format!(
             "SELECT rowid FROM ChatName2Id WHERE user_name = '{}' LIMIT 1;",
@@ -467,8 +487,9 @@ fn find_file_hash_via_resource_db(
     let chat_id_int = chat_rows.first()?.get("rowid")?.as_i64()?;
 
     // Query packed_info from MessageResourceInfo
-    let info_rows = query_wechat_db(
-        &resource_db,
+    let info_rows = query_fresh_wechat_db(
+        account_dir,
+        "message_resource.db",
         resource_key,
         &format!(
             "SELECT hex(packed_info) as hex_info FROM MessageResourceInfo
@@ -496,6 +517,26 @@ fn find_dat_via_resource_db(
     local_id: i64,
     create_time: i64,
 ) -> Option<String> {
+    let variants = image_dat_variants(account_dir, keys, chat_id, local_id, create_time)?;
+    // Best available: HD (_h.dat), then mid-res (.dat), then thumbnail (_t.dat)
+    for suffix in &["_h", "", "_t"] {
+        if let Some((_, path)) = variants.iter().find(|(s, _)| s == suffix) {
+            return Some(path.clone());
+        }
+    }
+    tracing::warn!("[media:resource-db] image file not on disk yet for local_id={local_id}");
+    None
+}
+
+/// Image `.dat` files present on disk for a message, as (suffix, path) pairs.
+/// Suffixes: "_h" (HD original), "" (mid-res), "_t" (thumbnail).
+fn image_dat_variants(
+    account_dir: &str,
+    keys: &HashMap<String, String>,
+    chat_id: &str,
+    local_id: i64,
+    create_time: i64,
+) -> Option<Vec<(&'static str, String)>> {
     let file_hash = find_file_hash_via_resource_db(account_dir, keys, chat_id, local_id)?;
 
     // Build path: msg/attach/<md5(chatId)>/<year-month>/Img/<hash>.dat
@@ -503,26 +544,84 @@ fn find_dat_via_resource_db(
     let dt = chrono::DateTime::from_timestamp(create_time, 0)?;
     let year_month = dt.format("%Y-%m").to_string();
 
+    let mut found = Vec::new();
     for base in &account_base_paths(account_dir) {
-        // Try mid-res .dat first, then _t.dat thumbnail
-        for suffix in &["", "_t"] {
+        for suffix in ["_h", "", "_t"] {
             let dat_path = Path::new(base)
                 .join("msg/attach")
                 .join(&chat_hash)
                 .join(&year_month)
                 .join("Img")
                 .join(format!("{file_hash}{suffix}.dat"));
-            if dat_path.exists() {
-                return Some(dat_path.to_string_lossy().to_string());
+            if dat_path.exists() && !found.iter().any(|(s, _)| *s == suffix) {
+                found.push((suffix, dat_path.to_string_lossy().to_string()));
             }
         }
     }
+    Some(found)
+}
 
-    tracing::warn!(
-        "[media:resource-db] file not on disk yet for hash={}",
-        file_hash
-    );
-    None
+/// True when an image's original (`_h.dat`) is not on disk yet but the image
+/// is known to WeChat (thumbnail and/or chat-size `.dat` present).
+pub(crate) fn image_missing_original(
+    account_dir: &str,
+    keys: &HashMap<String, String>,
+    chat_id: &str,
+    local_id: i64,
+    create_time: i64,
+) -> bool {
+    match image_dat_variants(account_dir, keys, chat_id, local_id, create_time) {
+        Some(v) => !v.is_empty() && !v.iter().any(|(s, _)| *s == "_h"),
+        None => false,
+    }
+}
+
+/// True when WeChat has only the thumbnail (`_t.dat`) of an image on disk.
+///
+/// The Linux client downloads the full image only once the message is shown
+/// in a chat view; until then only the thumbnail exists and callers would
+/// deliver a tiny image. Callers can open the chat to trigger the download.
+pub(crate) fn image_has_only_thumbnail(
+    account_dir: &str,
+    keys: &HashMap<String, String>,
+    chat_id: &str,
+    local_id: i64,
+    create_time: i64,
+) -> bool {
+    match image_dat_variants(account_dir, keys, chat_id, local_id, create_time) {
+        Some(v) => !v.is_empty() && v.iter().all(|(s, _)| *s == "_t"),
+        None => false,
+    }
+}
+
+/// True when a video's `.mp4` is not on disk yet but its resource entry is
+/// known (WeChat only has the cover until the bubble is clicked).
+pub(crate) fn video_missing_original(
+    account_dir: &str,
+    keys: &HashMap<String, String>,
+    chat_id: &str,
+    local_id: i64,
+    create_time: i64,
+) -> bool {
+    let Some(dt) = chrono::DateTime::from_timestamp(create_time, 0) else {
+        return false;
+    };
+    let year_month = dt.format("%Y-%m").to_string();
+    let Some(hash) = find_file_hash_via_resource_db(account_dir, keys, chat_id, local_id) else {
+        return false;
+    };
+    !account_base_paths(account_dir).iter().any(|base| {
+        Path::new(base)
+            .join("msg/video")
+            .join(&year_month)
+            .join(format!("{hash}.mp4"))
+            .exists()
+    })
+}
+
+/// Video length in seconds from the message XML (`playlength="4"`).
+pub(crate) fn video_play_length(content: &str) -> Option<u32> {
+    xml_attr(content, "playlength").and_then(|v| v.parse().ok())
 }
 
 /// Get video data: .mp4 if downloaded, otherwise cover .jpg or _thumb.jpg.
@@ -818,10 +917,9 @@ fn get_voice_data(
     media_dbs.sort_by_key(|(k, _)| k.to_string());
 
     for (db_name, media_key) in &media_dbs {
-        let media_db = get_db_path(account_dir, db_name);
-
-        let name_rows = query_wechat_db(
-            &media_db,
+        let name_rows = query_fresh_wechat_db(
+            account_dir,
+            db_name,
             media_key,
             &format!(
                 "SELECT rowid FROM Name2Id WHERE user_name = '{}';",
@@ -833,8 +931,9 @@ fn get_voice_data(
             None => continue,
         };
 
-        let voice_rows = query_wechat_db(
-            &media_db,
+        let voice_rows = query_fresh_wechat_db(
+            account_dir,
+            db_name,
             media_key,
             &format!(
                 "SELECT hex(voice_data) as hex_data FROM VoiceInfo
@@ -940,12 +1039,14 @@ pub fn get_message_media(
         match lookup_message_raw(account_dir, keys, chat_id, local_id) {
             Some(t) => t,
             None => {
+                // Not visible yet (e.g. not yet readable from the DB). Report
+                // pending so callers retry instead of caching "unsupported".
                 tracing::warn!(
                     "[media] lookup_message_raw returned None for chat_id={}, local_id={}",
                     chat_id,
                     local_id
                 );
-                return unsupported();
+                return pending();
             }
         };
 
@@ -953,8 +1054,9 @@ pub fn get_message_media(
     let sub = (local_type >> 32) as i32;
 
     match base {
-        49 if sub == 6 => {
-            // File attachment (appmsg subtype 6)
+        49 if sub == 6 || sub == 74 || content.contains("<type>74</type>") => {
+            // File attachment (appmsg subtype 6), or a file still uploading
+            // (74): get_file_attachment reports pending until it is on disk.
             return get_file_attachment(account_dir, &content, create_time, local_id);
         }
         3 => {
@@ -967,14 +1069,8 @@ pub fn get_message_media(
                 content.len()
             );
 
-            // Try cached thumbnail first
-            if let Some(thumb) = get_image_thumbnail(account_dir, chat_id, local_id, create_time) {
-                tracing::info!("[media] found thumbnail for local_id={}", local_id);
-                return thumb;
-            }
-            tracing::info!("[media] no thumbnail for local_id={}", local_id);
-
-            // Try .dat decryption if we have image keys
+            // Try .dat decryption first (HD / mid-res image when downloaded);
+            // the cached chat thumbnail is only a last resort.
             if let Some((aes_hex, xor_byte)) = image_keys_raw {
                 let image_keys = ImageKeys {
                     aes_key_hex: aes_hex,
@@ -1003,6 +1099,11 @@ pub fn get_message_media(
                 );
             } else {
                 tracing::warn!("[media] no image keys available for local_id={}", local_id);
+            }
+
+            if let Some(thumb) = get_image_thumbnail(account_dir, chat_id, local_id, create_time) {
+                tracing::info!("[media] using cached thumbnail for local_id={}", local_id);
+                return thumb;
             }
 
             // Image exists but can't be retrieved
@@ -1101,5 +1202,69 @@ mod tests {
             file_path: None,
         };
         assert_eq!(orig_res.role, Some("original".to_string()));
+    }
+
+    /// A message WeChat has just written sits in the live WAL until the next
+    /// checkpoint. `list_messages` sees it through the hot snapshot, so the
+    /// media lookup for the same message must see it too.
+    #[test]
+    fn test_lookup_message_raw_sees_uncheckpointed_wal_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let account_dir = tmp.path().to_str().unwrap();
+        let msg_dir = tmp.path().join("db_storage").join("message");
+        std::fs::create_dir_all(&msg_dir).unwrap();
+        // Unique numbered DB name keeps this test's snapshot cache separate.
+        let db_name = "message_7.db";
+        let db_path = msg_dir.join(db_name);
+
+        let chat_id = "wal_test_chat";
+        let table_name = get_msg_table_name(chat_id);
+        let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+        // Writer stays open with auto-checkpoint disabled, like WeChat between
+        // checkpoints: the chat table is checkpointed into the main file (as
+        // for any existing chat) but the new voice message (type 34) exists
+        // only in the WAL.
+        let writer = rusqlite::Connection::open(&db_path).unwrap();
+        writer
+            .execute_batch(&format!(
+                "PRAGMA key = \"x'{key}'\";
+                 PRAGMA cipher_compatibility = 4;
+                 PRAGMA journal_mode = WAL;
+                 PRAGMA wal_autocheckpoint = 0;
+                 CREATE TABLE \"{table_name}\" (
+                     local_id INTEGER PRIMARY KEY,
+                     local_type INTEGER,
+                     create_time INTEGER,
+                     message_content BLOB,
+                     WCDB_CT_message_content INTEGER
+                 );
+                 PRAGMA wal_checkpoint(TRUNCATE);
+                 INSERT INTO \"{table_name}\" VALUES (1, 34, 1790000000, CAST('voice' AS BLOB), 0);"
+            ))
+            .unwrap();
+        assert!(msg_dir.join(format!("{db_name}-wal")).exists());
+
+        let mut keys = HashMap::new();
+        keys.insert(db_name.to_string(), key.to_string());
+
+        // The immutable main-file read cannot see the WAL-only row.
+        let cold = query_wechat_db(
+            &get_db_path(account_dir, db_name),
+            key,
+            &format!("SELECT local_id FROM \"{table_name}\" WHERE local_id = 1;"),
+        );
+        assert!(cold.is_empty(), "immutable read unexpectedly saw WAL row");
+
+        std::env::set_var(
+            "WECHAT_LIVE_DB_CACHE_DIR",
+            tmp.path().join("cache").to_str().unwrap(),
+        );
+        let found = lookup_message_raw(account_dir, &keys, chat_id, 1);
+        let (local_type, create_time, _) = found.expect("WAL-only message must be found");
+        assert_eq!(local_type, 34);
+        assert_eq!(create_time, 1790000000);
+
+        drop(writer);
     }
 }

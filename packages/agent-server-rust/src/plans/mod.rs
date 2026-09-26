@@ -4,6 +4,7 @@ pub mod login;
 pub mod logout;
 pub mod multi_frame;
 pub mod send_message;
+pub mod video_download;
 
 use crate::ia::types::{A11yNode, AppState, IdentifiedStates, SelectedAction};
 
