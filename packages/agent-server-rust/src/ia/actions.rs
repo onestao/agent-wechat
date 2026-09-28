@@ -60,7 +60,7 @@ pub fn click_switch_account() -> Action {
 
 pub fn dismiss_popup() -> Action {
     Action::ClickSelector {
-        selector: r#"push-button[name=/OK|Confirm|确定|确认/i]"#.to_string(),
+        selector: r#"push-button[name=/^\s*(OK|Confirm|确定|确认)\s*$/i]"#.to_string(),
     }
 }
 

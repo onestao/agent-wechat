@@ -85,7 +85,7 @@ impl IAState for PopupConfirmState {
             });
         }
 
-        let ok_btn = query_selector(args.a11y, r#"push-button[name=/OK|Confirm|确定|确认/i]"#);
+        let ok_btn = query_selector(args.a11y, r#"push-button[name=/^\s*(OK|Confirm|确定|确认)\s*$/i]"#);
         if ok_btn.is_none() {
             return Ok(IdentifyResult {
                 identified: false,
@@ -131,3 +131,48 @@ impl IAState for PopupConfirmState {
 
 pub static POPUP_STATES: std::sync::LazyLock<Vec<Box<dyn IAState>>> =
     std::sync::LazyLock::new(|| vec![Box::new(PopupErrorState), Box::new(PopupConfirmState)]);
+
+#[cfg(test)]
+mod tests {
+    use crate::ia::identify_states;
+    use crate::ia::types::A11yNode;
+
+    fn chat_view_with_button(name: &str) -> A11yNode {
+        let mut a11y: A11yNode =
+            serde_json::from_str(include_str!("test_fixtures/chat_view.json")).unwrap();
+        let button = A11yNode {
+            role: "push-button".to_string(),
+            name: name.to_string(),
+            states: None,
+            bounds: None,
+            parent_index: None,
+            children: None,
+            window: None,
+        };
+        a11y.children.get_or_insert_with(Vec::new).push(button);
+        a11y
+    }
+
+    #[test]
+    fn test_chat_preview_containing_ok_is_not_a_popup() {
+        // A chat-list item whose preview text contains "ok" (e.g. "mokoko")
+        // used to be taken for a confirm dialog, and the dismiss action kept
+        // clicking that chat forever.
+        for name in ["泡泡玛特出求群 180求寻找mokoko×10", "Booking", "请确认收货地址"] {
+            let states = identify_states(&chat_view_with_button(name), "");
+            assert!(states.popup.is_none(), "false popup for {name:?}");
+        }
+    }
+
+    #[test]
+    fn test_real_confirm_buttons_are_popups() {
+        for name in ["OK", "Confirm", "确定", " 确认 "] {
+            let states = identify_states(&chat_view_with_button(name), "");
+            assert_eq!(
+                states.popup.as_ref().map(|p| p.state_id.as_str()),
+                Some("popup_confirm"),
+                "missed popup for {name:?}"
+            );
+        }
+    }
+}
