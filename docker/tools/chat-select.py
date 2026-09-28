@@ -300,7 +300,8 @@ def enumerate_sessions(pid, profile):
     pointer (heap scan), then reads the session vector directly from the
     controller. This is immune to stale session data after re-login.
 
-    Returns (dict of {username: index}, vector_base_hex, vector_count, current_sel_username|None).
+    Returns (dict of {username: index}, vector_base_hex, vector_count,
+    current_sel_username|None, controller_hex|None).
     """
     username_off = profile["USERNAME_OFF"]
     elem_size = profile["ELEM_SIZE"]
@@ -390,6 +391,7 @@ if (!manager) {{
 
     // Step 2: Get vector begin/end
     var ctrl = manager.add(CTRL_OFF).readPointer();
+    console.log("CTRL " + ctrl);
 {vec_access_js}
     if (vectorBegin.isNull() || vectorEnd.isNull() || vectorEnd.compare(vectorBegin) <= 0) {{
         console.log("ERROR: invalid vector pointers begin=" + vectorBegin + " end=" + vectorEnd);
@@ -435,9 +437,12 @@ if (!manager) {{
         vector_base = None
         vector_count = 0
         current_sel = None
+        ctrl_addr = None
         for line in lines:
             stripped = line.strip()
-            if stripped.startswith("VECTOR "):
+            if stripped.startswith("CTRL "):
+                ctrl_addr = stripped.split()[1]
+            elif stripped.startswith("VECTOR "):
                 parts = stripped.split()
                 vector_base = parts[1]
                 vector_count = int(parts[2].split("=")[1])
@@ -471,13 +476,21 @@ if (!manager) {{
 
             log(f"[chat-select] Filtered: {len(sessions)} sessions (excluded {gh_count} official accounts)")
 
-            return sessions, vector_base, vector_count, current_sel
-    return {}, None, 0, None
+            return sessions, vector_base, vector_count, current_sel, ctrl_addr
+    return {}, None, 0, None, None
 
 
-def select_by_index(pid, profile, target_index, click_coords, vector_base, vector_count):
-    """Hook selectSession, click, hook replaces index. Returns True on success."""
+def select_by_index(pid, profile, target_index, click_coords, vector_base, vector_count,
+                    ctrl_addr=None):
+    """Hook selectSession, click, hook replaces index.
+
+    Returns (redirected, selected_username). selected_username is the chat
+    WeChat reports as current right after selectSession returned, or None when
+    it could not be read.
+    """
     select_session = profile["SELECT_SESSION"]
+    cur_sess_off = profile["CUR_SESS_OFF"]
+    cur_sess_uname_off = profile["CUR_SESS_UNAME_OFF"]
     username_off = profile["USERNAME_OFF"]
     elem_size = profile["ELEM_SIZE"]
     # Register that holds the index argument: x1 on aarch64, rsi on x86_64
@@ -494,8 +507,22 @@ var UNAME_OFF = 0x{username_off:x};
 var ELEM_SZ = {elem_size};
 var VECTOR_BASE = ptr("{vector_base}");
 var VECTOR_COUNT = {vector_count};
+var CTRL = ptr("{ctrl_addr or '0x0'}");
+var CUR_SESS_OFF = 0x{cur_sess_off:x};
+var CUR_SESS_UNAME = 0x{cur_sess_uname_off:x};
 
 {READ_STD_STRING_JS}
+
+function readCurrentSelection() {{
+    try {{
+        if (CTRL.isNull()) return null;
+        var curPtr = CTRL.add(CUR_SESS_OFF).readPointer();
+        if (curPtr.isNull() || curPtr.compare(ptr(0x10000)) < 0) return null;
+        return readStdString(curPtr.add(CUR_SESS_UNAME));
+    }} catch(e) {{
+        return null;
+    }}
+}}
 
 // Read username at RAW vector index
 function readRawUsername(rawIdx) {{
@@ -541,6 +568,12 @@ var hook = Interceptor.attach(addr, {{
         // while no thread is inside the function.
         hook.detach();
         console.log("DETACHED");
+        // Report what WeChat actually selected, so the caller can detect an
+        // index that does not line up with the visible chat list.
+        setTimeout(function() {{
+            console.log("SELECTED " + (readCurrentSelection() || "NONE"));
+            console.log("SELECT_DONE");
+        }}, 300);
     }}
 }});
 """)
@@ -554,7 +587,9 @@ var hook = Interceptor.attach(addr, {{
                                  timeout=5, capture_output=True, text=True)
     log(f"[chat-select] Click result: {click_result.stdout.strip()}")
 
-    # Read output looking for DETACHED confirmation (hook fires once then detaches)
+    # Read output looking for the selection report (hook fires once, detaches,
+    # then reports the current selection).
+    stop_on = "SELECT_DONE" if ctrl_addr else "DETACHED"
     lines = []
     start = time.time()
     while time.time() - start < 5:
@@ -563,7 +598,7 @@ var hook = Interceptor.attach(addr, {{
             break
         line = line.rstrip()
         lines.append(line)
-        if "DETACHED" in line:
+        if stop_on in line:
             break
 
     kill_frida(proc)
@@ -571,7 +606,36 @@ var hook = Interceptor.attach(addr, {{
     redirected = any("REDIRECT" in l for l in lines)
     if not redirected:
         log(f"[chat-select] No REDIRECT seen in hook output. All lines: {lines}")
-    return redirected
+    selected = None
+    for l in lines:
+        l = l.strip()
+        if l.startswith("SELECTED "):
+            value = l.split(None, 1)[1].strip()
+            if value and value != "NONE":
+                selected = value
+    if selected:
+        log(f"[chat-select] WeChat reports selection: {selected}")
+    return redirected, selected
+
+
+def corrected_index(sessions, target, requested_index, selected):
+    """Return a corrected selectSession index, or None if no correction applies.
+
+    The filtered index assumes every gh_ account is hidden from the chat list.
+    Service accounts such as WeChat Pay can be listed as normal chats, which
+    shifts every chat below them by one. When WeChat selected a different known
+    chat, the distance between that chat and the target in our list is the
+    distance to move the requested index.
+    """
+    if not selected or selected == target or selected not in sessions:
+        return None
+    delta = sessions[target] - sessions[selected]
+    if delta == 0:
+        return None
+    candidate = requested_index + delta
+    if candidate < 0:
+        return None
+    return candidate
 
 
 def main():
@@ -612,7 +676,7 @@ def main():
 
     # Enumerate sessions
     log("[chat-select] Enumerating sessions...")
-    sessions, vector_base, vector_count, current_sel = enumerate_sessions(pid, profile)
+    sessions, vector_base, vector_count, current_sel, ctrl_addr = enumerate_sessions(pid, profile)
     if not sessions:
         result_json(False, error="No sessions found. Is WeChat logged in with chats visible?")
 
@@ -648,11 +712,24 @@ def main():
     # Hook and click
     if not vector_base:
         result_json(False, error="Session vector base address not found")
-    ok = select_by_index(pid, profile, target_index, click_coords, vector_base, vector_count)
-    if ok:
-        result_json(True, username=target, index=target_index)
-    else:
+    ok, selected = select_by_index(pid, profile, target_index, click_coords,
+                                   vector_base, vector_count, ctrl_addr)
+    if not ok:
         result_json(False, error="Hook did not fire. Click may not have landed on a chat item.")
+
+    retry_index = corrected_index(sessions, target, target_index, selected)
+    if retry_index is not None:
+        log(f"[chat-select] Selected {selected} instead of {target}; "
+            f"retrying with index {retry_index} (was {target_index})")
+        ok, selected = select_by_index(pid, profile, retry_index, click_coords,
+                                       vector_base, vector_count, ctrl_addr)
+        if not ok:
+            result_json(False, error="Hook did not fire on corrected selection retry.")
+        target_index = retry_index
+
+    if selected and selected != target:
+        result_json(False, error=f"Selected '{selected}' instead of '{target}'")
+    result_json(True, username=target, index=target_index)
 
 
 if __name__ == "__main__":
