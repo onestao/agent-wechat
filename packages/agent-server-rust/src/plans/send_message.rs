@@ -450,7 +450,18 @@ impl Plan for SendMessagePlan {
                 }
 
                 SendMessagePhase::Focusing => {
-                    if main_state_id != Some("chat_open") {
+                    // "chat_open" needs the selected row to be visible in the
+                    // chat list. A chat opened by chat-select that sits below
+                    // the visible part of the list is open (its title is in
+                    // the header) while the state reads "chat"; accept that
+                    // only when the header still verifies as the target.
+                    let target_open_offscreen = main_state_id == Some("chat")
+                        && plan_state
+                            .resolved_target_name
+                            .as_deref()
+                            .map(|t| matches!(verify_target_chat(a11y, t), Ok(true)))
+                            .unwrap_or(false);
+                    if main_state_id != Some("chat_open") && !target_open_offscreen {
                         plan_state.failure_reason = Some(format!(
                             "focusing_invalid_main_state:{}",
                             main_state_id.unwrap_or("none")
@@ -690,6 +701,7 @@ mod tests {
         let raw = match name {
             "f4" => include_str!("test_fixtures/f4_live_multi_frame_observed.json"),
             "f6" => include_str!("test_fixtures/f6_target_not_verified.json"),
+            "f7" => include_str!("test_fixtures/f7_target_already_open.json"),
             _ => panic!("unknown fixture"),
         };
         serde_json::from_str(raw).expect("fixture must parse")
@@ -774,6 +786,68 @@ mod tests {
         assert!(
             matches!(state.phase, SendMessagePhase::Done),
             "State should transition to Done"
+        );
+    }
+
+    async fn focusing_with_main_state(
+        state_id: &str,
+        target: &str,
+    ) -> (Option<SelectedAction>, SendMessagePlanState) {
+        let plan = SendMessagePlan;
+        let mut state = plan.initial_plan_state();
+        state.phase = SendMessagePhase::Focusing;
+        state.resolved_target_name = Some(target.to_string());
+        let identified = IdentifiedStates {
+            main_window: Some(IdentifiedState {
+                state_id: state_id.to_string(),
+                fsm: "mainWindow".to_string(),
+                frame: None,
+            }),
+            popup: None,
+            contact_card: None,
+            settings: None,
+        };
+        let params = SendMessageParams {
+            chat_id: "bob".to_string(),
+            message: Some("hello".to_string()),
+            image_path: None,
+            image_mime: None,
+            file_path: None,
+        };
+        let a11y = fixture("f7");
+        let action = plan
+            .select_action(
+                &AppState::default(),
+                &params,
+                &identified,
+                &mut state,
+                &a11y,
+                "s",
+            )
+            .await;
+        (action, state)
+    }
+
+    #[tokio::test]
+    async fn test_focusing_accepts_verified_chat_scrolled_out_of_the_list() {
+        // chat-select can open a chat whose row is below the visible part of
+        // the chat list: the header shows the target but no row is SELECTED,
+        // so the state reads "chat".
+        let (action, state) = focusing_with_main_state("chat", "Bob").await;
+        assert!(state.failure_reason.is_none(), "{:?}", state.failure_reason);
+        assert!(matches!(state.phase, SendMessagePhase::Inputting));
+        assert!(action
+            .map(|a| !action_contains_return(&a.action))
+            .unwrap_or(true));
+    }
+
+    #[tokio::test]
+    async fn test_focusing_rejects_chat_state_when_header_is_another_chat() {
+        let (action, state) = focusing_with_main_state("chat", "Alice").await;
+        assert!(action.is_none());
+        assert_eq!(
+            state.failure_reason.as_deref(),
+            Some("focusing_invalid_main_state:chat")
         );
     }
 
