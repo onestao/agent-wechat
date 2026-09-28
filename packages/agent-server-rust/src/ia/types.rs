@@ -404,6 +404,16 @@ pub struct ReplyInfo {
     #[ts(optional)]
     pub sender: Option<String>,
     pub content: String,
+    /// Server id (svrid) of the quoted message, as a decimal string. It is a
+    /// 64-bit value, so it is kept as a string to survive JSON number
+    /// handling in JavaScript consumers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub server_id: Option<String>,
+    /// WeChat id of the quoted message's sender (fromusr).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub sender_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

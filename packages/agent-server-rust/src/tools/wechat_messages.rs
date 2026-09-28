@@ -117,6 +117,12 @@ pub(crate) fn extract_reply_info(content: &str, msg_type: i32) -> Option<ReplyIn
     let refermsg = &content[rm_start..rm_end];
 
     let sender = extract_xml_tag(refermsg, "displayname");
+    let server_id = extract_xml_tag(refermsg, "svrid")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty() && v != "0" && v.bytes().all(|b| b.is_ascii_digit()));
+    let sender_id = extract_xml_tag(refermsg, "fromusr")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
     let ref_content = extract_xml_tag(refermsg, "content").unwrap_or_default();
 
     // The referred content may be XML-escaped — unescape first
@@ -135,6 +141,8 @@ pub(crate) fn extract_reply_info(content: &str, msg_type: i32) -> Option<ReplyIn
     Some(ReplyInfo {
         sender,
         content: clean,
+        server_id,
+        sender_id,
     })
 }
 
@@ -537,11 +545,33 @@ mod tests {
         let r = reply_info.as_ref().unwrap();
         assert_eq!(r.sender, Some("Alice".to_string()));
         assert_eq!(r.content, "Original idea");
+        assert_eq!(r.server_id.as_deref(), Some("987654321"));
+        assert_eq!(r.sender_id.as_deref(), Some("wxid_sender1"));
 
         let (kind, subtype, filename) = classify_message(xml, 49, &reply_info);
         assert_eq!(kind, Some("reply".to_string()));
         assert_eq!(subtype, Some(57));
         assert_eq!(filename, None);
+    }
+
+    #[test]
+    fn test_refermsg_large_svrid_is_kept_exact() {
+        let xml = r#"<msg><appmsg><type>57</type><title>1</title><refermsg><type>3</type><svrid>7412963524102716521</svrid><fromusr>wxid_a</fromusr><displayname>A</displayname><content>&lt;msg&gt;&lt;img /&gt;&lt;/msg&gt;</content></refermsg></appmsg></msg>"#;
+        let r = extract_reply_info(xml, 49).unwrap();
+        assert_eq!(r.server_id.as_deref(), Some("7412963524102716521"));
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["serverId"], "7412963524102716521");
+        assert_eq!(json["senderId"], "wxid_a");
+    }
+
+    #[test]
+    fn test_refermsg_without_svrid_has_no_server_id() {
+        let xml = r#"<msg><appmsg><type>57</type><title>ok</title><refermsg><type>1</type><displayname>B</displayname><content>hi</content></refermsg></appmsg></msg>"#;
+        let r = extract_reply_info(xml, 49).unwrap();
+        assert_eq!(r.server_id, None);
+        assert_eq!(r.sender_id, None);
+        let json = serde_json::to_value(&r).unwrap();
+        assert!(json.get("serverId").is_none());
     }
 
     #[test]
