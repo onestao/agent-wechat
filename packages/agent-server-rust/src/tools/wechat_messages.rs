@@ -101,7 +101,73 @@ pub(crate) fn clean_content(content: &str, msg_type: i32) -> String {
                 }
             }
         }
+        // VoIP call record (type 50): replace call XML with a short summary
+        50 => summarize_voip_call(content).unwrap_or_else(|| content.to_string()),
         _ => content.to_string(),
+    }
+}
+
+/// Summarize a VoIP call record as short text.
+///
+/// Private (1:1) calls are stored as type 50 XML. Two shapes are observed:
+/// - `<voipmsg type="VoIPBubbleMsg">` – the call bubble; `<msg>` holds the
+///   status WeChat shows ("已取消", "对方已拒绝", "通话时长 01:23", ...).
+/// - `<voipinvitemsg>` – a call invitation, usually without text.
+///
+/// `room_type` / `invite_type`: 1 is a voice call, 0 a video call. Group
+/// calls (multitalk) are reported as a group call. When the status has no
+/// duration but `<duration>` (seconds) is set, the duration is appended.
+fn summarize_voip_call(content: &str) -> Option<String> {
+    let label = |media: Option<String>| match media.as_deref().map(str::trim) {
+        Some("1") => "语音通话",
+        Some("0") => "视频通话",
+        _ => "通话",
+    };
+    let with_duration = |status: Option<String>| -> Option<String> {
+        let secs = extract_xml_tag(content, "duration")
+            .and_then(|d| d.trim().parse::<u64>().ok())
+            .filter(|d| *d > 0);
+        match (status, secs) {
+            (Some(s), Some(d)) if !s.contains("时长") => {
+                Some(format!("{s} · 通话时长 {}", format_call_duration(d)))
+            }
+            (Some(s), _) => Some(s),
+            (None, Some(d)) => Some(format!("通话时长 {}", format_call_duration(d))),
+            (None, None) => None,
+        }
+    };
+    if content.contains("<VoIPBubbleMsg>") {
+        let label = label(extract_xml_tag(content, "room_type"));
+        return Some(match with_duration(extract_xml_tag(content, "msg")) {
+            Some(status) => format!("[{label}] {status}"),
+            None => format!("[{label}]"),
+        });
+    }
+    if content.contains("<voipinvitemsg>") {
+        let label = label(extract_xml_tag(content, "invite_type"));
+        return Some(
+            match with_duration(extract_xml_tag(content, "display_content")) {
+                Some(text) => format!("[{label}] {text}"),
+                None => format!("[{label}] 来电"),
+            },
+        );
+    }
+    if content.contains("multitalk") || content.contains("<voipmultitalk") {
+        return Some("[群通话]".to_string());
+    }
+    if content.contains("<voip") {
+        return Some("[通话]".to_string());
+    }
+    None
+}
+
+/// 75 -> "01:15", 3725 -> "1:02:05".
+fn format_call_duration(secs: u64) -> String {
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m:02}:{s:02}")
     }
 }
 
@@ -425,7 +491,9 @@ pub(crate) fn classify_message(
         34 => (Some("voice".to_string()), None, None),
         43 => (Some("video".to_string()), None, None),
         47 => (Some("sticker".to_string()), None, None),
-        10000 | 10002 => (Some("system".to_string()), None, None),
+        // VoIP call records (type 50) are call status notices, like group
+        // call notices which already arrive as type 10000 system messages.
+        10000 | 10002 | 50 => (Some("system".to_string()), None, None),
         49 => {
             let appmsg_type = if body.contains("<msg>") {
                 extract_xml_tag(body, "type")
@@ -558,6 +626,75 @@ mod tests {
         assert_eq!(kind2, Some("unknown".to_string()));
         assert_eq!(subtype2, None);
         assert_eq!(filename2, None);
+    }
+
+    #[test]
+    fn test_type50_voip_bubble_outgoing_cancelled() {
+        // Private call placed by the account owner and cancelled (IDs replaced).
+        let xml = r#"<voipmsg type="VoIPBubbleMsg"><VoIPBubbleMsg><msg><![CDATA[已取消]]></msg>
+<room_type>1</room_type>
+<red_dot>false</red_dot>
+<roomid>100000000000000001</roomid>
+<roomkey>0</roomkey>
+<inviteid>1000000001</inviteid>
+<msg_type>100</msg_type>
+<timestamp>1790436203922</timestamp>
+<identity><![CDATA[1000000000000000001]]></identity>
+<duration>0</duration>
+<inviteid64>1790436199151</inviteid64>
+<business>1</business>
+<caller_memberid>0</caller_memberid>
+<callee_memberid>1</callee_memberid>
+<force_update>0</force_update>
+</VoIPBubbleMsg></voipmsg>"#;
+        assert_eq!(clean_content(xml, 50), "[语音通话] 已取消");
+        let (kind, subtype, filename) = classify_message(xml, 50, &None);
+        assert_eq!(kind, Some("system".to_string()));
+        assert_eq!(subtype, None);
+        assert_eq!(filename, None);
+    }
+
+    #[test]
+    fn test_type50_voip_invite_incoming() {
+        // Private call received from a contact.
+        let xml = r#"<voipinvitemsg><roomid>0</roomid><key>0</key><status>0</status><invite_type>1</invite_type></voipinvitemsg><voipextinfo><recvtime>0</recvtime></voipextinfo><voiplocalinfo><wording_type>4609</wording_type><duration>0</duration><display_content></display_content></voiplocalinfo>"#;
+        assert_eq!(clean_content(xml, 50), "[语音通话] 来电");
+        let (kind, _, _) = classify_message(xml, 50, &None);
+        assert_eq!(kind, Some("system".to_string()));
+    }
+
+    #[test]
+    fn test_type50_voip_fallbacks() {
+        // Connected call: the status already carries the duration.
+        let bubble = r#"<voipmsg type="VoIPBubbleMsg"><VoIPBubbleMsg><msg><![CDATA[通话时长 00:12]]></msg><room_type>1</room_type><duration>0</duration></VoIPBubbleMsg></voipmsg>"#;
+        assert_eq!(clean_content(bubble, 50), "[语音通话] 通话时长 00:12");
+        // Video call.
+        let video = bubble.replace("<room_type>1</room_type>", "<room_type>0</room_type>");
+        assert_eq!(clean_content(&video, 50), "[视频通话] 通话时长 00:12");
+        // Unknown media type is reported as a generic call, not guessed.
+        let other = bubble.replace("<room_type>1</room_type>", "<room_type>7</room_type>");
+        assert_eq!(clean_content(&other, 50), "[通话] 通话时长 00:12");
+        // Duration in seconds only: appended.
+        let secs = r#"<voipmsg type="VoIPBubbleMsg"><VoIPBubbleMsg><msg><![CDATA[已挂断]]></msg><room_type>1</room_type><duration>3725</duration></VoIPBubbleMsg></voipmsg>"#;
+        assert_eq!(
+            clean_content(secs, 50),
+            "[语音通话] 已挂断 · 通话时长 1:02:05"
+        );
+        // Invitation that carries display text keeps it.
+        let invite = r#"<voipinvitemsg><invite_type>1</invite_type></voipinvitemsg><voiplocalinfo><display_content>对方已拒绝</display_content></voiplocalinfo>"#;
+        assert_eq!(clean_content(invite, 50), "[语音通话] 对方已拒绝");
+        // Group call and other VoIP XML never leak raw markup.
+        assert_eq!(
+            clean_content("<voipmultitalk><x>1</x></voipmultitalk>", 50),
+            "[群通话]"
+        );
+        assert_eq!(
+            clean_content("<voipnotifymsg><x>1</x></voipnotifymsg>", 50),
+            "[通话]"
+        );
+        // Non-XML content is left untouched.
+        assert_eq!(clean_content("plain", 50), "plain");
+        assert_eq!(format_call_duration(75), "01:15");
     }
 
     #[test]
