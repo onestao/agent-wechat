@@ -1059,12 +1059,15 @@ fn get_file_attachment(
         .map(|d| d.format("%Y-%m").to_string())
         .unwrap_or_default();
 
+    let expected_md5 = extract_xml_tag(content, "md5").map(|m| m.trim().to_ascii_lowercase());
+    let expected_len =
+        extract_xml_tag(content, "totallen").and_then(|v| v.trim().parse::<u64>().ok());
+
     for base in &account_base_paths(account_dir) {
-        let file_path = Path::new(base)
-            .join("msg/file")
-            .join(&year_month)
-            .join(&filename);
-        if file_path.exists() {
+        let dir = Path::new(base).join("msg/file").join(&year_month);
+        if let Some(file_path) =
+            pick_received_file(&dir, &filename, expected_md5.as_deref(), expected_len)
+        {
             let p_str = file_path.to_string_lossy().to_string();
             return MediaResult {
                 media_type: "file".into(),
@@ -1080,6 +1083,80 @@ fn get_file_attachment(
 
     // File not yet downloaded by WeChat
     pending()
+}
+
+/// Split "name.ext" into ("name", ".ext"); a name without extension keeps "".
+fn split_file_name(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    }
+}
+
+/// WeChat saves a second file with the same name as "name(1).ext",
+/// "name(2).ext", ... so the plain name is usually the *oldest* copy.
+/// Pick the copy that belongs to this message: the XML md5 decides; without
+/// it, a copy with the expected size, newest first; otherwise the plain name.
+fn pick_received_file(
+    dir: &Path,
+    filename: &str,
+    expected_md5: Option<&str>,
+    expected_len: Option<u64>,
+) -> Option<std::path::PathBuf> {
+    let (stem, ext) = split_file_name(filename);
+    let mut candidates: Vec<(std::path::PathBuf, u64, std::time::SystemTime)> = Vec::new();
+    let entries = fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_copy = name == filename
+            || name
+                .strip_prefix(stem)
+                .and_then(|rest| rest.strip_suffix(ext))
+                .and_then(|mid| mid.strip_prefix('('))
+                .and_then(|mid| mid.strip_suffix(')'))
+                .map(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                .unwrap_or(false);
+        if !is_copy {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        candidates.push((entry.path(), meta.len(), modified));
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+    // Newest first.
+    candidates.sort_by(|a, b| b.2.cmp(&a.2));
+
+    let sized: Vec<&(std::path::PathBuf, u64, std::time::SystemTime)> = match expected_len {
+        Some(len) => candidates.iter().filter(|c| c.1 == len).collect(),
+        None => candidates.iter().collect(),
+    };
+
+    if let Some(want) = expected_md5.filter(|m| m.len() == 32) {
+        for candidate in &sized {
+            if let Ok(bytes) = fs::read(&candidate.0) {
+                if format!("{:x}", Md5::digest(&bytes)) == want {
+                    return Some(candidate.0.clone());
+                }
+            }
+        }
+    }
+    if let Some(candidate) = sized.first() {
+        return Some(candidate.0.clone());
+    }
+    // A size mismatch usually means WeChat has not finished writing the
+    // file yet: keep it pending rather than serve a different copy.
+    if expected_len.is_some() {
+        return None;
+    }
+    let plain = dir.join(filename);
+    plain.exists().then_some(plain)
 }
 
 // ── Public entry point ───────────────────────────────────────────────────────
@@ -1209,6 +1286,47 @@ pub fn get_message_media_with_raw(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_file(dir: &Path, name: &str, body: &[u8]) {
+        fs::write(dir.join(name), body).unwrap();
+    }
+
+    #[test]
+    fn test_received_file_picks_the_copy_matching_md5_and_size() {
+        let dir = std::env::temp_dir().join(format!("wx-files-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        write_file(&dir, "OW报表.xls", b"old version");
+        write_file(&dir, "OW报表(1).xls", b"newer version!");
+        write_file(&dir, "OW报表(2).xls", b"latest version");
+        write_file(&dir, "OW报表 copy.xls", b"latest version");
+        let latest_md5 = format!("{:x}", Md5::digest(b"latest version"));
+
+        let picked = pick_received_file(&dir, "OW报表.xls", Some(&latest_md5), Some(14)).unwrap();
+        assert_eq!(picked.file_name().unwrap(), "OW报表(2).xls");
+
+        // Without md5, the size decides.
+        let picked = pick_received_file(&dir, "OW报表.xls", None, Some(11)).unwrap();
+        assert_eq!(picked.file_name().unwrap(), "OW报表.xls");
+
+        // Expected size not on disk yet: still downloading, stay pending.
+        assert!(pick_received_file(&dir, "OW报表.xls", None, Some(999)).is_none());
+
+        // No metadata at all: the plain name, as before.
+        let picked = pick_received_file(&dir, "OW报表.xls", None, None).unwrap();
+        assert!(picked
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("OW报表"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_split_file_name() {
+        assert_eq!(split_file_name("a.b.xls"), ("a.b", ".xls"));
+        assert_eq!(split_file_name("README"), ("README", ""));
+        assert_eq!(split_file_name(".env"), (".env", ""));
+    }
 
     #[test]
     fn test_url_backed_sticker_resolution() {
