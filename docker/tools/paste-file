@@ -28,8 +28,16 @@ ABS_PATH="$(realpath "$FILE")"
 
 # Copy file URI to clipboard (backgrounded — xclip blocks until
 # the selection is consumed, so it must run in parallel with the paste)
+pkill -x xclip >/dev/null 2>&1 || true
 echo -n "file://$ABS_PATH" | xclip -selection clipboard -t text/uri-list >/dev/null 2>&1 &
-sleep 0.1
+# Wait until the new owner offers the file URI (up to ~2s) so a previous
+# clipboard owner is never pasted instead.
+for _ in $(seq 1 20); do
+  if xclip -selection clipboard -o -t TARGETS 2>/dev/null | grep -qx "text/uri-list"; then
+    break
+  fi
+  sleep 0.1
+done
 
 # Paste using Ctrl+V (consumes the clipboard, letting xclip exit)
 xdotool key ctrl+v
