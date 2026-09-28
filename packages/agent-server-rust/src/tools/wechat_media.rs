@@ -102,15 +102,7 @@ pub(crate) fn lookup_message_raw(
 
 /// Extract an XML attribute value.
 fn xml_attr(xml: &str, attr: &str) -> Option<String> {
-    let pat = format!("{attr}=\"");
-    let start = xml.find(&pat)? + pat.len();
-    let end = xml[start..].find('"')? + start;
-    let val = xml[start..end].trim().to_string();
-    if val.is_empty() {
-        None
-    } else {
-        Some(val)
-    }
+    super::wechat_messages::extract_xml_attr(xml, attr)
 }
 
 // ── Image thumbnail from filesystem cache ────────────────────────────────────
@@ -1226,6 +1218,19 @@ mod tests {
         assert_eq!(res.filename, "emoji_deadbeef9988.gif");
         assert_eq!(res.role, Some("original".to_string()));
         assert_eq!(res.file_path, None);
+    }
+
+    #[test]
+    fn test_sticker_with_spaced_attributes_resolves_cdn_url() {
+        let keys = HashMap::new();
+        let content = r#"<msg><emoji fromusername = "wxid_a" md5 = "a3564410d0736e6d208afd055323c2cc" androidmd5 = "ffff" cdnurl = "http://wxapp.tc.qq.com/262/20304/stodownload?m=a35&amp;filekey=x" encrypturl = "http://enc" aeskey = "k"></emoji></msg>"#;
+        let res = get_emoji_media("dummy_account", &keys, content, 102);
+        assert_eq!(res.media_type, "sticker");
+        assert_eq!(
+            res.url.as_deref(),
+            Some("http://wxapp.tc.qq.com/262/20304/stodownload?m=a35&filekey=x")
+        );
+        assert_eq!(res.filename, "emoji_a3564410d0736e6d208afd055323c2cc.gif");
     }
 
     #[test]

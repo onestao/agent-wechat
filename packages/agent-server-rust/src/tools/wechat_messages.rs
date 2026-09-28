@@ -79,6 +79,8 @@ pub(crate) fn clean_content(content: &str, msg_type: i32) -> String {
                 .and_then(|t| t.parse::<i32>().ok())
                 .unwrap_or(0);
             match appmsg_type {
+                2000 => summarize_transfer(content),
+                2001 => summarize_red_packet(content),
                 // Link share (5), video link (4), music share (3)
                 3 | 4 | 5 => {
                     let mut parts = Vec::new();
@@ -139,15 +141,87 @@ pub(crate) fn extract_reply_info(content: &str, msg_type: i32) -> Option<ReplyIn
 }
 
 /// Extract an XML attribute value: attr="value"
-fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
-    let pattern = format!("{attr}=\"");
-    let start = xml.find(&pattern)? + pattern.len();
-    let end = xml[start..].find('"')? + start;
-    let val = xml[start..end].trim().to_string();
-    if val.is_empty() {
-        None
-    } else {
-        Some(val)
+pub(crate) fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
+    // WeChat 4 writes some elements with spaces around '=' (for example
+    // `<emoji md5 = "..." cdnurl = "...">`), so allow them. The name must
+    // start at an attribute boundary: `md5` must not match `androidmd5`.
+    let bytes = xml.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = xml[from..].find(attr) {
+        let pos = from + rel;
+        from = pos + attr.len();
+        let boundary = pos == 0 || bytes[pos - 1].is_ascii_whitespace();
+        if !boundary {
+            continue;
+        }
+        let rest = xml[from..].trim_start();
+        let Some(rest) = rest.strip_prefix('=') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix('"') else {
+            continue;
+        };
+        let end = rest.find('"')?;
+        let val = unescape_xml(rest[..end].trim());
+        return if val.is_empty() { None } else { Some(val) };
+    }
+    None
+}
+
+/// Decode the five predefined XML entities (attribute values carry `&amp;`
+/// inside URLs).
+pub(crate) fn unescape_xml(value: &str) -> String {
+    if !value.contains('&') {
+        return value.to_string();
+    }
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+/// "[转账] ￥12.00 · 待收款 · 备注：…" for a WeChat transfer (appmsg 2000).
+fn summarize_transfer(content: &str) -> String {
+    let info = extract_xml_tag(content, "wcpayinfo").unwrap_or_default();
+    let amount = extract_xml_tag(&info, "feedesc");
+    let state = match extract_xml_tag(&info, "paysubtype")
+        .as_deref()
+        .map(str::trim)
+    {
+        Some("1") => Some("待收款"),
+        Some("3") => Some("已收款"),
+        Some("4") => Some("已退还"),
+        _ => None,
+    };
+    let memo = extract_xml_tag(&info, "pay_memo");
+    let mut parts = vec![match amount {
+        Some(a) => format!("[转账] {a}"),
+        None => "[转账]".to_string(),
+    }];
+    if let Some(s) = state {
+        parts.push(s.to_string());
+    }
+    if let Some(m) = memo {
+        parts.push(format!("备注：{m}"));
+    }
+    parts.join(" · ")
+}
+
+/// "[红包] 恭喜发财，大吉大利" / "[群收款] 活动收款" (appmsg 2001).
+fn summarize_red_packet(content: &str) -> String {
+    let info = extract_xml_tag(content, "wcpayinfo").unwrap_or_default();
+    let scene = extract_xml_tag(&info, "scenetext");
+    let label = match scene.as_deref() {
+        Some(s) if s.contains("收款") => "[群收款]",
+        _ => "[红包]",
+    };
+    match extract_xml_tag(&info, "sendertitle").or_else(|| extract_xml_tag(&info, "receivertitle"))
+    {
+        Some(title) => format!("{label} {title}"),
+        None => label.to_string(),
     }
 }
 
@@ -449,6 +523,10 @@ pub(crate) fn classify_message(
                 (Some("file".to_string()), Some(6), fname)
             } else if appmsg_type == 5 || appmsg_type == 3 || appmsg_type == 4 {
                 (Some("link".to_string()), Some(appmsg_type), None)
+            } else if appmsg_type == 2000 || appmsg_type == 2001 {
+                // Transfers and red packets carry a readable summary in the
+                // content (amount, state, memo); deliver them as text.
+                (Some("text".to_string()), Some(appmsg_type), None)
             } else {
                 (
                     Some("unknown".to_string()),
@@ -542,6 +620,56 @@ mod tests {
         assert_eq!(kind, Some("reply".to_string()));
         assert_eq!(subtype, Some(57));
         assert_eq!(filename, None);
+    }
+
+    #[test]
+    fn test_type47_sticker_with_spaced_attributes() {
+        // WeChat 4 writes emoji attributes with spaces around '='.
+        let xml = r#"<msg><emoji fromusername = "wxid_a" tousername = "wxid_b" type = "2" md5 = "a3564410d0736e6d208afd055323c2cc" androidmd5 = "ffff" cdnurl = "http://wxapp.tc.qq.com/262/20304/stodownload?m=a3564410&amp;filekey=abc&amp;bizid=1023" width = "200" height = "148"></emoji></msg>"#;
+        assert_eq!(
+            clean_content(xml, 47),
+            "http://wxapp.tc.qq.com/262/20304/stodownload?m=a3564410&filekey=abc&bizid=1023"
+        );
+        assert_eq!(
+            extract_xml_attr(xml, "md5").as_deref(),
+            Some("a3564410d0736e6d208afd055323c2cc")
+        );
+    }
+
+    #[test]
+    fn test_xml_attr_needs_a_boundary() {
+        let xml = r#"<img originsourcemd5="bbbb" md5="aaaa" />"#;
+        assert_eq!(extract_xml_attr(xml, "md5").as_deref(), Some("aaaa"));
+        assert_eq!(extract_xml_attr(r#"<x androidmd5="b" />"#, "md5"), None);
+    }
+
+    #[test]
+    fn test_transfer_summary() {
+        let xml = r#"<msg><appmsg appid="" sdkver=""><title><![CDATA[微信转账]]></title><des><![CDATA[收到转账12.00元。如需收钱，请点此升级至最新版本]]></des><type>2000</type><wcpayinfo><paysubtype>1</paysubtype><feedesc><![CDATA[￥12.00]]></feedesc><pay_memo><![CDATA[货款]]></pay_memo></wcpayinfo></appmsg></msg>"#;
+        assert_eq!(
+            clean_content(xml, 49),
+            "[转账] ￥12.00 · 待收款 · 备注：货款"
+        );
+        let (kind, subtype, _) = classify_message(xml, 49, &None);
+        assert_eq!(kind.as_deref(), Some("text"));
+        assert_eq!(subtype, Some(2000));
+
+        let received = xml
+            .replace("<paysubtype>1</paysubtype>", "<paysubtype>3</paysubtype>")
+            .replace(
+                "<pay_memo><![CDATA[货款]]></pay_memo>",
+                "<pay_memo></pay_memo>",
+            );
+        assert_eq!(clean_content(&received, 49), "[转账] ￥12.00 · 已收款");
+    }
+
+    #[test]
+    fn test_red_packet_summary() {
+        let red = r#"<msg><appmsg><title><![CDATA[微信红包]]></title><type>2001</type><wcpayinfo><scenetext><![CDATA[微信红包]]></scenetext><sendertitle><![CDATA[恭喜发财，大吉大利]]></sendertitle></wcpayinfo></appmsg></msg>"#;
+        assert_eq!(clean_content(red, 49), "[红包] 恭喜发财，大吉大利");
+        let aa = r#"<msg><appmsg><title></title><type>2001</type><wcpayinfo><receivertitle><![CDATA[活动收款]]></receivertitle><sendertitle><![CDATA[活动收款]]></sendertitle><scenetext><![CDATA[群收款]]></scenetext></wcpayinfo></appmsg></msg>"#;
+        assert_eq!(clean_content(aa, 49), "[群收款] 活动收款");
+        assert_eq!(classify_message(aa, 49, &None).0.as_deref(), Some("text"));
     }
 
     #[test]
